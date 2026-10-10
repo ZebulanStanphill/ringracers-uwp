@@ -42,3 +42,6 @@ foreach ($Scene in @('clear','readrect','opaque','translucent','additive','subtr
     Write-Host $NegativeLog
     if ($NegativeExit -ne 1 -or $NegativeLog -notmatch "NEGATIVE_ORACLE_REJECTED: $Scene") { throw "D3D12 $Scene negative control was not rejected by its oracle (exit $NegativeExit)" }
 }
+
+# Expected failing native controls must not become the enclosing CI shell exit code.
+$global:LASTEXITCODE = 0
