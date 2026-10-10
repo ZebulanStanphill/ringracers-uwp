@@ -1,4 +1,4 @@
-From ae11be808f865c94dbf9fe8e5016ccf8af69ce0e Mon Sep 17 00:00:00 2001
+From b08b8069bfe3dc2402967b1ac5bceaf72a3e789a Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -406,6 +406,14 @@ Agent: Claude (Haiku, D3D12 drawing documentation)
 Model: claude-haiku-5-5
 Agent: Claude Code (Opus, D3D12 drawing review)
 Model: claude-opus-5-5
+
+- Add D3D12 WARP and small upload-ring test hooks, plus cached, fence-waited
+  ReadRect readback with the existing RGB24/RGB565 screenshot semantics.
+
+Agent: Codex (Sol, D3D12 WARP tests)
+Model: gpt-6.1-sol
+Agent: Codex (Sol, D3D12 engine hooks)
+Model: gpt-6.1-sol
 ---
  CMakeLists.txt                            |   19 +-
  CMakePresets.json                         |   17 +
@@ -441,8 +449,8 @@ Model: claude-opus-5-5
  src/hardware/r_d3d11/r_d3d11.h            |   72 +
  src/hardware/r_d3d11/shaders.hlsl         |  660 +++
  src/hardware/r_d3d12/allocators.h         |   69 +
- src/hardware/r_d3d12/d3d12_core.cpp       |  811 +++
- src/hardware/r_d3d12/d3d12_core.h         |  134 +
+ src/hardware/r_d3d12/d3d12_core.cpp       |  823 +++
+ src/hardware/r_d3d12/d3d12_core.h         |  137 +
  src/hardware/r_d3d12/d3d12_interop.cpp    |  558 ++
  src/hardware/r_d3d12/d3d12_interop.h      |   49 +
  src/hardware/r_d3d12/d3d12_pipeline.cpp   |  173 +
@@ -454,8 +462,8 @@ Model: claude-opus-5-5
  src/hardware/r_d3d12/d3d12_upload.cpp     |  112 +
  src/hardware/r_d3d12/d3d12_upload.h       |   54 +
  src/hardware/r_d3d12/pipeline_key.h       |   51 +
- src/hardware/r_d3d12/r_d3d12.cpp          | 1936 +++++++
- src/hardware/r_d3d12/r_d3d12.h            |   50 +
+ src/hardware/r_d3d12/r_d3d12.cpp          | 2026 +++++++
+ src/hardware/r_d3d12/r_d3d12.h            |   53 +
  src/hardware/r_opengl/r_opengl.c          |  308 +-
  src/http-mserv.c                          |    2 +
  src/hwr2/patch_atlas.cpp                  |    8 +
@@ -509,7 +517,7 @@ Model: claude-opus-5-5
  src/w_wad.cpp                             |  312 +
  src/w_wad.h                               |   11 +
  src/z_zone.cpp                            |    5 +
- 102 files changed, 20240 insertions(+), 1126 deletions(-)
+ 102 files changed, 20348 insertions(+), 1126 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -13882,10 +13890,10 @@ index 0000000..116cccd
 +#endif
 diff --git a/src/hardware/r_d3d12/d3d12_core.cpp b/src/hardware/r_d3d12/d3d12_core.cpp
 new file mode 100644
-index 0000000..60c52ae
+index 0000000..0a62357
 --- /dev/null
 +++ b/src/hardware/r_d3d12/d3d12_core.cpp
-@@ -0,0 +1,811 @@
+@@ -0,0 +1,823 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// This program is free software distributed under the
@@ -13932,6 +13940,7 @@ index 0000000..60c52ae
 +UINT g_rtvStep = 0, g_dsvStep = 0;
 +UINT64 g_frequency = 0;
 +bool g_uma = false;
++bool g_forceWarp = false;
 +bool g_dred = false;
 +HRESULT g_dredResult = S_OK;
 +
@@ -14213,6 +14222,11 @@ index 0000000..60c52ae
 +	return g_errors;
 +}
 +
++void Core_ForceWarp(bool force)
++{
++	g_forceWarp = force;
++}
++
 +bool Core_Init(ID3D11Device *angle)
 +{
 +	if (g_device)
@@ -14235,6 +14249,12 @@ index 0000000..60c52ae
 +			|| Core_Failed(dxgiDevice->GetAdapter(&angleAdapter), "GetAdapter (ANGLE)")
 +			|| Core_Failed(angleAdapter->GetDesc(&angleDesc), "GetDesc (ANGLE)")
 +			|| Core_Failed(factory->EnumAdapterByLuid(angleDesc.AdapterLuid, IID_PPV_ARGS(&adapter)), "EnumAdapterByLuid"))
++			return false;
++	}
++	else if (g_forceWarp)
++	{
++		Core_Log("no ANGLE device: using WARP for testing");
++		if (Core_Failed(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)), "EnumWarpAdapter"))
 +			return false;
 +	}
 +	else
@@ -14699,10 +14719,10 @@ index 0000000..60c52ae
 +} // namespace rr_d3d12
 diff --git a/src/hardware/r_d3d12/d3d12_core.h b/src/hardware/r_d3d12/d3d12_core.h
 new file mode 100644
-index 0000000..e287592
+index 0000000..37b1d4e
 --- /dev/null
 +++ b/src/hardware/r_d3d12/d3d12_core.h
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,137 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// This program is free software distributed under the
@@ -14748,6 +14768,9 @@ index 0000000..e287592
 +// Makes the device on ANGLE's adapter (found by LUID; without ANGLE, the first hardware adapter), its queue, fence
 +// and an open command list. Called again after a failure, it tries again.
 +bool Core_Init(ID3D11Device *angle);
++
++// Test hook: selects WARP only when Core_Init has no ANGLE device. Set before initialization.
++void Core_ForceWarp(bool force);
 +
 +// Releases everything if the GPU is idle (or the device was removed); otherwise keeps it all until exit, since
 +// releasing objects a list may still use is undefined. Call after the driver has retired or released its own objects.
@@ -17853,10 +17876,10 @@ index 0000000..736f77d
 +#endif
 diff --git a/src/hardware/r_d3d12/r_d3d12.cpp b/src/hardware/r_d3d12/r_d3d12.cpp
 new file mode 100644
-index 0000000..6ae8d90
+index 0000000..6bb739c
 --- /dev/null
 +++ b/src/hardware/r_d3d12/r_d3d12.cpp
-@@ -0,0 +1,1936 @@
+@@ -0,0 +1,2026 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// Copyright (C) 2025 by Kart Krew.
@@ -18441,12 +18464,15 @@ index 0000000..6ae8d90
 +ComPtr<ID3D12Resource> g_rt; // RENDER_TARGET, except while the present copy reads it
 +ComPtr<ID3D12Resource> g_depth; // DEPTH_WRITE
 +UINT g_rtWidth = 0, g_rtHeight = 0;
++ComPtr<ID3D12Resource> g_readRectBuffer;
++UINT64 g_readRectBytes = 0, g_readRectFence = 0;
 +
 +// Shader-visible descriptors are persistent and never rewritten while in use.
 +ComPtr<ID3D12RootSignature> g_root;
 +ComPtr<ID3D12DescriptorHeap> g_srvHeap, g_samplerHeap;
 +ComPtr<ID3D12Resource> g_zeroConstants;
 +UploadRing g_vertexRing, g_indexRing, g_constantRing;
++size_t g_testVertexBytes = 0, g_testIndexBytes = 0, g_testConstantBytes = 0;
 +Constants g_lastConstants = {};
 +bool g_constantsValid = false;
 +UploadAllocation g_constantAllocation;
@@ -18518,8 +18544,8 @@ index 0000000..6ae8d90
 +	if (Core_Failed(g_zeroConstants->Map(0, &none, &cpu), "Map zero constants")) return false;
 +	memset(cpu, 0, 1024);
 +	g_zeroConstants->Unmap(0, nullptr);
-+	return g_vertexRing.Init(16 << 20, L"vertex ring") && g_indexRing.Init(8 << 20, L"index ring")
-+		&& g_constantRing.Init(4 << 20, L"constant ring");
++	return g_vertexRing.Init(g_testVertexBytes ? g_testVertexBytes : 16 << 20, L"vertex ring") && g_indexRing.Init(g_testIndexBytes ? g_testIndexBytes : 8 << 20, L"index ring")
++		&& g_constantRing.Init(g_testConstantBytes ? g_testConstantBytes : 4 << 20, L"constant ring");
 +}
 +
 +void BindViewport()
@@ -19176,16 +19202,88 @@ index 0000000..6ae8d90
 +		pTexInfo->downloaded = 0;
 +}
 +
-+// Readback arrives in S9; initialize the caller's output while it remains a stub.
-+void D3D_ReadRect(INT32, INT32, INT32 width, INT32 height, INT32 dst_stride, UINT16 *dst_data)
++void D3D_ReadRect(INT32 x, INT32 y, INT32 width, INT32 height, INT32 dst_stride, UINT16 *dst_data)
 +{
-+	D3D12_LOG_ONCE("ReadRect not drawn yet (S9)");
-+	if (!dst_data || width <= 0 || height <= 0)
++	if (!CanDraw() || !dst_data || width <= 0 || height <= 0)
 +		return;
-+	if (dst_stride == width*3)
-+		memset(dst_data, 0, (size_t)height * dst_stride);
-+	else
-+		memset(dst_data, 0, (size_t)width * height * sizeof *dst_data);
++
++	// OpenGL's y goes up from the bottom of the screen.
++	const INT64 top = (INT64)g_rtHeight - ((INT64)y + height);
++	if (x < 0 || top < 0 || (INT64)x + width > g_rtWidth || top + height > g_rtHeight)
++	{
++		Log("ReadRect(%d, %d, %d, %d) is outside the %ux%u screen", (int)x, (int)y, (int)width, (int)height, g_rtWidth, g_rtHeight);
++		return;
++	}
++
++	// A timed-out copy must finish before its cached destination can be reused.
++	if (g_readRectFence && !Core_Wait(g_readRectFence, 500, "the previous ReadRect"))
++		return;
++	g_readRectFence = 0;
++	const UINT pitch = (UINT)(((UINT64)width * 4 + 255) & ~UINT64(255));
++	const UINT64 bytes = (UINT64)pitch * height;
++	if (!g_readRectBuffer || g_readRectBytes < bytes)
++	{
++		D3D12_HEAP_PROPERTIES heap = {};
++		heap.Type = D3D12_HEAP_TYPE_READBACK;
++		D3D12_RESOURCE_DESC desc = {};
++		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++		desc.Width = bytes;
++		desc.Height = 1;
++		desc.DepthOrArraySize = desc.MipLevels = 1;
++		desc.SampleDesc.Count = 1;
++		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++		ComPtr<ID3D12Resource> buffer;
++		if (Core_Failed(Core_Device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
++			D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)), "CreateCommittedResource (ReadRect)"))
++			return;
++		g_readRectBuffer = buffer;
++		g_readRectBytes = bytes;
++		g_readRectBuffer->SetName(L"ReadRect readback");
++	}
++
++	D3D12_TEXTURE_COPY_LOCATION source = {};
++	source.pResource = g_rt.Get();
++	source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++	D3D12_TEXTURE_COPY_LOCATION destination = {};
++	destination.pResource = g_readRectBuffer.Get();
++	destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++	destination.PlacedFootprint.Footprint = {kScreenFormat, (UINT)width, (UINT)height, 1, pitch};
++	const D3D12_BOX box = {(UINT)x, (UINT)top, 0, (UINT)(x + width), (UINT)(top + height), 1};
++	Core_Transition(g_rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
++	Core_FlushBarriers();
++	Core_List()->CopyTextureRegion(&destination, 0, 0, 0, &source, &box);
++	Core_Transition(g_rt.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
++	g_readRectFence = Core_Submit("readback");
++	if (!g_readRectFence || !Core_Wait(g_readRectFence, 500, "ReadRect"))
++		return;
++
++	void *data = nullptr;
++	const D3D12_RANGE read = {0, (SIZE_T)bytes};
++	if (Core_Failed(g_readRectBuffer->Map(0, &read, &data), "Map (ReadRect)"))
++		return;
++	const bool bgra = kScreenFormat == DXGI_FORMAT_B8G8R8A8_UNORM;
++	UINT8 *rgb = reinterpret_cast<UINT8 *>(dst_data);
++	// Top row first, like r_opengl.c leaves it.
++	for (INT32 row = 0; row < height; row++)
++	{
++		const UINT8 *sourceRow = static_cast<const UINT8 *>(data) + (size_t)row * pitch;
++		for (INT32 column = 0; column < width; column++)
++		{
++			const UINT8 *pixel = sourceRow + column * 4;
++			const UINT8 r = bgra ? pixel[2] : pixel[0], g = pixel[1], b = bgra ? pixel[0] : pixel[2];
++			if (dst_stride == width*3)
++			{
++				UINT8 *out = rgb + (size_t)row * dst_stride + column * 3;
++				out[0] = r;
++				out[1] = g;
++				out[2] = b;
++			}
++			else
++				dst_data[row*width + column] = (UINT16)(((r>>3)<<11) | ((g>>2)<<5) | (b>>3));
++		}
++	}
++	const D3D12_RANGE written = {0, 0};
++	g_readRectBuffer->Unmap(0, &written);
 +}
 +
 +void D3D_GClipRect(INT32 minx, INT32 miny, INT32 maxx, INT32 maxy, float nearclip)
@@ -19747,7 +19845,7 @@ index 0000000..6ae8d90
 +		vertex.peakBytes / 1048576.0, index.peakBytes / 1048576.0, constants.peakBytes / 1048576.0,
 +		vertex.wraps, index.wraps, constants.wraps, vertex.stalls + index.stalls + constants.stalls,
 +		vertex.stallMs + index.stallMs + constants.stallMs, vertex.grows + index.grows + constants.grows);
-+	I_OutputMsg("UWP perf:   D3D12: not drawn yet: %.1f skies, %.1f models, %.0f texture sets, %.1f updates, %.1f deletes, %d flushes, %.1f screen calls, %.1f portal calls, %d fade maps; palettes, light tables, fog/water captures, ReadRect, custom shaders\n",
++	I_OutputMsg("UWP perf:   D3D12: not drawn yet: %.1f skies, %.1f models, %.0f texture sets, %.1f updates, %.1f deletes, %d flushes, %.1f screen calls, %.1f portal calls, %d fade maps; palettes, light tables, fog/water captures, custom shaders\n",
 +		s.skies / n, s.models / n, s.textureSets / n, s.textureUpdates / n, s.textureDeletes / n,
 +		s.flushes, s.screens / n, s.portals / n, s.fadeMaps);
 +
@@ -19763,6 +19861,13 @@ index 0000000..6ae8d90
 +		I_OutputMsg("UWP perf:   D3D12: memory: local unavailable; render targets/present slots ~%.1f MB\n", targets / 1048576.0);
 +
 +	memset(&g_stats, 0, sizeof g_stats);
++}
++
++void D3D12_SetRingBytesForTest(size_t vertex, size_t index, size_t constant)
++{
++	g_testVertexBytes = vertex;
++	g_testIndexBytes = index;
++	g_testConstantBytes = constant;
 +}
 +
 +void D3D12_Shutdown(void)
@@ -19786,6 +19891,14 @@ index 0000000..6ae8d90
 +		Core_Retire(g_rt);
 +		Core_Retire(g_depth);
 +	}
++	if (idle)
++		g_readRectBuffer.Reset();
++	else
++	{
++		Core_Retire(g_readRectBuffer);
++		g_readRectBuffer.Reset();
++	}
++	g_readRectBytes = g_readRectFence = 0;
 +	Core_SetListBegin(nullptr);
 +	g_vertexRing.Shutdown(); g_indexRing.Shutdown(); g_constantRing.Shutdown();
 +	for (auto &pipeline : g_pipelines) Core_Retire(pipeline.second);
@@ -19795,10 +19908,10 @@ index 0000000..6ae8d90
 +}
 diff --git a/src/hardware/r_d3d12/r_d3d12.h b/src/hardware/r_d3d12/r_d3d12.h
 new file mode 100644
-index 0000000..8812bd9
+index 0000000..fcc2dcd
 --- /dev/null
 +++ b/src/hardware/r_d3d12/r_d3d12.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,53 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// Copyright (C) 2025 by Kart Krew.
@@ -19822,6 +19935,9 @@ index 0000000..8812bd9
 +#ifdef __cplusplus
 +extern "C" {
 +#endif
++
++// Test hook: set before initialization; zero keeps the production ring size.
++void D3D12_SetRingBytesForTest(size_t vertex, size_t index, size_t constant);
 +
 +void *D3D12_GetDriverFunction(const char *name);
 +boolean D3D12_Surface(INT32 w, INT32 h);
