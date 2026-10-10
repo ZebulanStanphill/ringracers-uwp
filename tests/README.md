@@ -188,7 +188,10 @@ the real engine headers. SDL, engine-symbol and headless-present functions are
 test stubs. ANGLE is not used. Shaders compile with `fxc` at SM5.1 against the
 production root signature. Scenes run on WARP with the debug layer and GPU-based
 validation enabled. Any debug-layer warning, error or corruption message, or any
-`Core_Errors` report, fails the run. Scenes cover clears, blends, depth, indexed
+`Core_Errors` report, fails the run. The sole allowlist is warning #820 about
+a missing or mismatched optimized render-target clear value: the runtime guarantees
+the requested clear color, which the pixel oracle checks. It only affects clear
+performance. Scenes cover clears, blends, depth, indexed
 triangles, 2D lines and a tiny-ring stress test, and negative controls must fail. If the Graphics
 Tools feature is missing, the script retries its install and then fails loudly
 rather than running without the debug layer.
