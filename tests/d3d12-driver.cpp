@@ -106,6 +106,7 @@ int main(int argc,char **argv) {
     ComPtr<ID3D12Debug> debug; ComPtr<ID3D12Debug1> gbv;
     if(FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))) || FAILED(debug.As(&gbv))) { fputs("D3D12 debug layer/GBV unavailable; install Windows Graphics Tools\n",stderr); return 77; }
     debug->EnableDebugLayer(); gbv->SetEnableGPUBasedValidation(TRUE);
+    puts("D3D12 debug layer and GPU-based validation enabled");
     try {
         Core_ForceWarp(true); D3D12_SetRingBytesForTest(1024,512,2048);
         if(!function<boolean (*)()>("Init")() || !D3D12_Surface(W,H)) throw std::runtime_error("Init/Surface failed");
@@ -136,7 +137,12 @@ int main(int argc,char **argv) {
         unsigned ringSubmissions=0; auto rp=logs.find("mid-frame: ring "); if(rp==std::string::npos || sscanf(logs.c_str()+rp,"mid-frame: ring %u",&ringSubmissions)!=1 || !ringSubmissions) throw std::runtime_error("stress had no ring submissions");
         Prewarm_Stop(); if(!Core_WaitIdle(30000,"validation")) throw std::runtime_error("idle failed"); validate(queue.Get());
         D3D12_Shutdown(); validate(queue.Get());
-        if(negative=="shutdown") { negativeRejected=true; throw std::runtime_error("shutdown oracle negative control"); }
+        const bool closed = Core_Device() == nullptr;
+        const bool expectedClosed = negative != "shutdown";
+        if (closed != expectedClosed) {
+            negativeRejected = negative == "shutdown";
+            throw std::runtime_error("shutdown device lifetime oracle failed");
+        }
         if(!negative.empty()) throw std::runtime_error("unknown or unexercised negative control");
         puts("Production D3D12 WARP driver scenes passed (RGB tolerance 1, GBV clean)"); return 0;
     } catch(const std::exception &e) { fprintf(stderr,"FAIL: %s\n",e.what()); D3D12_Shutdown(); if(negativeRejected) fprintf(stderr,"NEGATIVE_ORACLE_REJECTED: %s\n",negative.c_str()); return 1; }

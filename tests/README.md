@@ -176,9 +176,10 @@ continues to compile the actual UWP and shader code.
 
 ## Direct3D 12 WARP harness
 
-From an x64 Visual Studio developer PowerShell on Windows, after `prepare-source.py`:
+From an x64 Visual Studio developer PowerShell on Windows:
 
 ```powershell
+python tests/prepare-source.py build/shader-regression-source
 ./tests/run-d3d12.ps1 -Engine build/shader-regression-source
 ```
 
