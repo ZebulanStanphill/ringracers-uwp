@@ -1,4 +1,4 @@
-From b08b8069bfe3dc2402967b1ac5bceaf72a3e789a Mon Sep 17 00:00:00 2001
+From 468a2cde3da8432c73a952f6afe2122574918d96 Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -414,6 +414,10 @@ Agent: Codex (Sol, D3D12 WARP tests)
 Model: gpt-6.1-sol
 Agent: Codex (Sol, D3D12 engine hooks)
 Model: gpt-6.1-sol
+
+- Fix PF_Invert sharing PF_Occlude's bit: use the unused blend bit 0x80,
+  so inversion survives the blend mask and does not enable depth writes.
+  The real D3D12 WARP inversion pixel oracle found this upstream collision.
 ---
  CMakeLists.txt                            |   19 +-
  CMakePresets.json                         |   17 +
@@ -433,7 +437,7 @@ Model: gpt-6.1-sol
  src/hardware/hw_cache.c                   |  335 +-
  src/hardware/hw_clip.c                    |   15 +
  src/hardware/hw_clip.h                    |    5 +
- src/hardware/hw_defs.h                    |    9 +-
+ src/hardware/hw_defs.h                    |   11 +-
  src/hardware/hw_draw.c                    |  116 +-
  src/hardware/hw_drv.h                     |   13 +
  src/hardware/hw_glob.h                    |   11 +
@@ -517,7 +521,7 @@ Model: gpt-6.1-sol
  src/w_wad.cpp                             |  312 +
  src/w_wad.h                               |   11 +
  src/z_zone.cpp                            |    5 +
- 102 files changed, 20348 insertions(+), 1126 deletions(-)
+ 102 files changed, 20349 insertions(+), 1127 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -2616,7 +2620,7 @@ index 1942f42..71bda47 100644
  #ifdef HAVE_SPHEREFRUSTRUM
  void gld_FrustrumSetup(void);
 diff --git a/src/hardware/hw_defs.h b/src/hardware/hw_defs.h
-index 1ce225f..4442d73 100644
+index 1ce225f..9a2f121 100644
 --- a/src/hardware/hw_defs.h
 +++ b/src/hardware/hw_defs.h
 @@ -21,6 +21,9 @@ extern "C" {
@@ -2629,6 +2633,15 @@ index 1ce225f..4442d73 100644
  #define NZCLIP_PLANE 0.9f // Seems to be only used for the HUD and screen textures
  
  // ==========================================================================
+@@ -224,7 +227,7 @@ enum EPolyFlags
+ 	PF_Subtractive      = 0x00000010,   // Subtractive color blending
+ 	PF_ReverseSubtract  = 0x00000020,   // Reverse subtract, used in wall splats (decals)
+ 	PF_Multiplicative   = 0x00000040,   // Multiplicative color blending
+-	PF_Invert           = 0x00000100,   // Polygon inverts the colours of what it's in front of
++	PF_Invert           = 0x00000080,   // Polygon inverts the colours of what it's in front of
+ 	PF_Fog              = 0x20000000,   // Fog blocks
+ 	PF_NoAlphaTest      = 0x40000000,   // Disables alpha testing
+ 	PF_Blending         = (PF_Masked|PF_Translucent|PF_Environment|PF_Additive|PF_Subtractive|PF_ReverseSubtract|PF_Multiplicative|PF_Invert|PF_Fog) & ~PF_NoAlphaTest,
 @@ -243,7 +246,8 @@ enum EPolyFlags
  	PF_RemoveYWrap      = 0x00010000,   // Forces clamp texture on Y
  	PF_ForceWrapX       = 0x00020000,   // Forces repeat texture on X

@@ -22,6 +22,7 @@
 #undef max
 #undef clamp
 using namespace rr_d3d12;
+static_assert((PF_Invert & PF_Occlude) == 0, "Inversion must not alias depth writes");
 static std::string logs, negative;
 static bool negativeRejected=false;
 extern "C" {

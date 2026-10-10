@@ -192,7 +192,9 @@ validation enabled. Any debug-layer warning, error or corruption message, or any
 a missing or mismatched optimized render-target clear value: the runtime guarantees
 the requested clear color, which the pixel oracle checks. It only affects clear
 performance. Scenes cover clears, blends, depth, indexed
-triangles, 2D lines and a tiny-ring stress test, and negative controls must fail. If the Graphics
+triangles, 2D lines and a tiny-ring stress test, and negative controls must fail.
+The inversion oracle caught the upstream `PF_Invert`/`PF_Occlude` bit collision;
+`PF_Invert` now uses its own blend bit, so it survives the blend mask. If the Graphics
 Tools feature is missing, the script retries its install and then fails loudly
 rather than running without the debug layer.
 
