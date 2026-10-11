@@ -1,4 +1,4 @@
-From ece043eb852f516230d965e4cc93b9c77aad9cd7 Mon Sep 17 00:00:00 2001
+From bbb4043c11b7186d9ce30305a7e84566243cbdd5 Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -619,6 +619,14 @@ Agent: Codex (Sol, light table diagnostic tests)
 Model: gpt-6.1-sol
 Agent: Claude Code (Haiku, light table audit)
 Model: claude-haiku-5-5
+
+- [UWP]: Turn DRED off in the Direct3D 12 driver for now. The light-table
+  check on Xbox showed a table's first 32-bit word becoming zero mid-race
+  with no driver operation writing to it, which fits DRED's automatic
+  breadcrumb counters being written into reused memory.
+
+Agent: Claude Code (Opus, light table diagnosis)
+Model: claude-opus-5-5
 ---
  CMakeLists.txt                              |   19 +-
  CMakePresets.json                           |   17 +
@@ -657,7 +665,7 @@ Model: claude-haiku-5-5
  src/hardware/r_d3d12/allocators.h           |  196 +
  src/hardware/r_d3d12/d3d12_arenas.inc       |   94 +
  src/hardware/r_d3d12/d3d12_captures.inc     |  272 +
- src/hardware/r_d3d12/d3d12_core.cpp         |  845 +++
+ src/hardware/r_d3d12/d3d12_core.cpp         |  853 +++
  src/hardware/r_d3d12/d3d12_core.h           |  140 +
  src/hardware/r_d3d12/d3d12_interop.cpp      |  558 ++
  src/hardware/r_d3d12/d3d12_interop.h        |   49 +
@@ -733,7 +741,7 @@ Model: claude-haiku-5-5
  src/w_wad.cpp                               |  312 +
  src/w_wad.h                                 |   11 +
  src/z_zone.cpp                              |    5 +
- 113 files changed, 24190 insertions(+), 1137 deletions(-)
+ 113 files changed, 24198 insertions(+), 1137 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -15176,10 +15184,10 @@ index 0000000..dfa1f46
 +}
 diff --git a/src/hardware/r_d3d12/d3d12_core.cpp b/src/hardware/r_d3d12/d3d12_core.cpp
 new file mode 100644
-index 0000000..ff690d3
+index 0000000..3324ad9
 --- /dev/null
 +++ b/src/hardware/r_d3d12/d3d12_core.cpp
-@@ -0,0 +1,845 @@
+@@ -0,0 +1,853 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// This program is free software distributed under the
@@ -15329,6 +15337,14 @@ index 0000000..ff690d3
 +void EnableDred()
 +{
 +	// Must happen before the device is made. Optional: on Xbox it may not exist.
++	// [UWP]: Off for now. On Xbox a light table's first 32-bit word turned to zero mid-race with nothing in the
++	// driver writing to it, which fits DRED's breadcrumb counters landing in reused memory.
++	constexpr bool kDred = false;
++	if (!kDred)
++	{
++		g_dredResult = E_NOTIMPL;
++		return;
++	}
 +	ComPtr<ID3D12DeviceRemovedExtendedDataSettings> settings;
 +	g_dredResult = D3D12GetDebugInterface(IID_PPV_ARGS(&settings));
 +	g_dred = SUCCEEDED(g_dredResult) && settings;
