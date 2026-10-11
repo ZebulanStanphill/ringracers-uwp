@@ -14,6 +14,8 @@
 #include "p_tick.h"
 #include "r_fps.h"
 #include "doomstat.h"
+#include "g_state.h"
+#include "p_setup.h"
 #include "f_finale.h"
 #include "w_wad.h"
 #include "hardware/hw_drv.h"
@@ -48,6 +50,9 @@ boolean F_WipeIsToBlack(UINT8 m) { return m==1; }
 boolean F_WipeIsToWhite(UINT8 m) { return m==2; }
 boolean F_WipeIsToInvert(UINT8 m) { return m==3; }
 tic_t leveltime=0;
+gamestate_t gamestate=GS_LEVEL;
+INT16 gamemap=1;
+boolean levelloading=0, g_reloadingMap=0;
 postimg_t postimgtype[MAXSPLITSCREENPLAYERS]={};
 enum viewcontext_e viewcontext=VIEWCONTEXT_PLAYER1;
 // FADE0000 and FADE0001 exist; any other mask is missing, which leaves the two-pass wipe
@@ -1050,6 +1055,75 @@ int main(int argc,char **argv) {
           if(logs.find("not drawn yet: ")==std::string::npos || logs.find("postimage not drawn")!=std::string::npos) throw std::runtime_error("the not-drawn-yet line is wrong"); }
         unsigned vw=0,iw=0,cw=0,st=0,grows=0; auto pos=logs.find("; wraps "); if(pos==std::string::npos || sscanf(logs.c_str()+pos,"; wraps %u/%u/%u; stalls %u",&vw,&iw,&cw,&st)!=4) throw std::runtime_error("missing ring perf counters"); auto gp=logs.find("; grows ",pos); if(gp==std::string::npos || sscanf(logs.c_str()+gp,"; grows %u",&grows)!=1 || !grows || !(vw+iw+cw) || !st) throw std::runtime_error("stress did not wrap/stall and grow rings");
         unsigned ringSubmissions=0; auto rp=logs.find("mid-frame: ring "); if(rp==std::string::npos || sscanf(logs.c_str()+rp,"mid-frame: ring %u",&ringSubmissions)!=1 || !ringSubmissions) throw std::runtime_error("stress had no ring submissions");
+        // Production all-table diagnostics: creation, changed GPU contents, bounded logs,
+        // and lifetime/cadence reset. Run after perf accounting so these fixtures are isolated.
+        {
+            auto createLightTable=function<UINT32 (*)(RGBA_t *)>("CreateLightTable");
+            auto clearLightTables=function<void (*)()>("ClearLightTables");
+            auto flushTextures=function<void (*)()>("ClearMipMapCache");
+            auto require=[&](bool ok,const char *message) {
+                if(!ok) { negativeRejected=negative=="lighttable-diagnostics"; throw std::runtime_error(message); }
+            };
+            auto lines=[](const std::string &text,const std::string &prefix) {
+                std::vector<std::string> result;
+                for(size_t p=0;(p=text.find(prefix,p))!=std::string::npos;) {
+                    size_t end=text.find('\n',p);
+                    result.push_back(text.substr(p,end==std::string::npos?end:end-p));
+                    if(end==std::string::npos) break;
+                    p=end+1;
+                }
+                return result;
+            };
+            std::vector<RGBA_t> table(256*33);
+            for(size_t i=0;i<table.size();i++) {
+                table[i].s.red=(UINT8)(i*7); table[i].s.green=(UINT8)(i*11);
+                table[i].s.blue=(UINT8)(i*19); table[i].s.alpha=255;
+            }
+            D3D12_CheckLightTablesForTest(0.0); // Hold diagnostic time steady during slow WARP/GBV work.
+            for(int cycle=0;cycle<3;cycle++) {
+                clearLightTables();
+                std::array<UINT32,3> ids={};
+                for(size_t i=0;i<ids.size();i++) {
+                    table[0].s.red=(UINT8)(cycle*31+i*17);
+                    size_t start=logs.size(); ids[i]=createLightTable(table.data());
+                    require(ids[i]!=0,"diagnostic light table creation failed");
+                    auto creation=lines(logs.substr(start),"UWP D3D12: lighttable check: reason=create ");
+                    require(creation.size()==1,"each light table creation must log one readback");
+                    require(creation[0].find("id="+std::to_string(ids[i])+" ")!=std::string::npos &&
+                        creation[0].find("mismatches=0 ")!=std::string::npos &&
+                        creation[0].find("error=none")!=std::string::npos,
+                        "created GPU light table differs from retained CPU table");
+                }
+                // Texture cache flushing must leave every light table's diagnostic source alive.
+                flushTextures(); reset(); D3D12_FinishUpdate(0); validate(validationQueue);
+                size_t start=logs.size();
+                D3D12_CheckLightTablesForTest(.25);
+                require(logs.size()==start,"clear/recreate must reset the diagnostic timer");
+                // Corrupt a different position each cycle: a first/last-only check cannot pass.
+                // Negative control omits the real upload fault, keeping the mismatch oracle intact.
+                if(negative!="lighttable-diagnostics")
+                    require(D3D12_CorruptLightTableForTest(ids[cycle])!=0,"diagnostic GPU corruption hook failed");
+                start=logs.size(); D3D12_CheckLightTablesForTest(.5);
+                require(logs.size()==start,"diagnostic timer checked before one second");
+                start=logs.size(); D3D12_CheckLightTablesForTest(1.0);
+                std::string changed=logs.substr(start);
+                auto timer=lines(changed,"UWP D3D12: lighttable check: reason=timer ");
+                require(timer.size()==1,"periodic diagnostic must log only the changed table");
+                require(timer[0].find("id="+std::to_string(ids[cycle])+" ")!=std::string::npos &&
+                    timer[0].find("mismatches=1 ")!=std::string::npos &&
+                    timer[0].find("first=(0,0)")!=std::string::npos,
+                    "periodic diagnostic did not detect the corrupted GPU texel");
+                require(changed.find("lighttable events:")!=std::string::npos &&
+                    changed.find("lighttable event:")!=std::string::npos,
+                    "GPU mismatch must dump recent texture events");
+                start=logs.size(); D3D12_CheckLightTablesForTest(2.0);
+                require(logs.size()==start,"unchanged GPU mismatch must not repeat its diagnostics");
+                reset(); D3D12_FinishUpdate(0); validate(validationQueue);
+            }
+            clearLightTables();
+            size_t start=logs.size(); D3D12_CheckLightTablesForTest(1.0);
+            require(logs.size()==start,"cleared light tables must leave no stale diagnostics");
+        }
         Prewarm_Stop(); if(!Core_WaitIdle(30000,"validation")) throw std::runtime_error("idle failed"); validate(queue.Get());
         D3D12_Shutdown(); validate(queue.Get());
         const bool closed = Core_Device() == nullptr;

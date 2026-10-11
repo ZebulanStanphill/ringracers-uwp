@@ -21,7 +21,8 @@ template<class T> struct ComPtr {std::shared_ptr<T> p; T*Get()const{return p.get
 #define IID_PPV_ARGS(x) (x)
 struct GpuTexture {ComPtr<ID3D12Resource> res; int format=4,state=3;};
 struct Texture:GpuTexture {RGBA_t paletteProbeExpected{};bool paletteProbeWhite=true;UINT paletteProbeX=2,paletteProbeY=1,width=4,height=2,mips=1,id=1;};
-struct LightTable:GpuTexture {RGBA_t probeWhite[2]{};UINT8 probeWhiteColumn=0;bool probeWhiteValid=false;};
+constexpr bool kLightTableDiagnostics=true;
+struct LightTable:GpuTexture {std::vector<RGBA_t> probeCpu;bool probeExpectedChanged=false;RGBA_t probeWhite[2]{};UINT8 probeWhiteColumn=0;bool probeWhiteValid=false;};
 static GpuTexture g_paletteLookup,g_screenPalette; static std::map<UINT,LightTable> g_lightTables; static LightTable*g_currentLightTable; static Texture*g_units[1];
 static bool g_paletteProbePending,g_paletteRendering=true,g_postImage,g_waterRefraction,g_fogRemap,g_paletteProbeLutValid=true; static UINT g_paletteProbeDraws,g_paletteProbeLutWhite;static const char*g_paletteProbeSkip; static RGBA_t g_palette[32]{},g_screenPaletteColors[256]{},*pMasterPalette;
 constexpr UINT PF_ColorMapped=1; static UINT g_currentPolyFlags;
@@ -59,6 +60,8 @@ int main(){
  Reset();g_paletteProbeLutWhite=7;g_paletteLookup.res->value=7;
  std::vector<RGBA_t> colors(256*33);colors[7].s={255,254,253,255};colors[32*256+7].s={253,255,254,255};
  RememberPaletteProbeLightTable(*g_currentLightTable,colors.data());assert(g_currentLightTable->probeWhiteValid&&g_currentLightTable->probeWhiteColumn==7);
+ assert(g_currentLightTable->probeExpectedChanged);
+ assert(g_currentLightTable->probeCpu.size()==colors.size()&&!std::memcmp(g_currentLightTable->probeCpu.data(),colors.data(),colors.size()*sizeof(RGBA_t)));
  g_currentLightTable->res->bytes.resize(colors.size()*4);std::memcpy(g_currentLightTable->res->bytes.data(),colors.data(),colors.size()*4);
  g_screenPaletteColors[7].s={254,253,255,255};g_screenPalette.res->bytes.resize(256*4);std::memcpy(g_screenPalette.res->bytes.data(),g_screenPaletteColors,256*4);
  texture.paletteProbeExpected.rgba=0xffffffff;texture.res->value=255;
@@ -69,6 +72,12 @@ int main(){
  g_paletteProbeLutWhite=8;g_paletteProbePending=true;MaybePaletteProbe(LAYOUT_POLY,false);
  assert(logs.back().find("column=8 uploadColumn=7 tableCPU=unavailable")!=std::string::npos&&logs.back().find("tableMatch=-1")!=std::string::npos);
  g_paletteProbeLutValid=false;RememberPaletteProbeLightTable(*g_currentLightTable,colors.data());assert(!g_currentLightTable->probeWhiteValid);
+ // Full-table diagnostics retain an independent snapshot even before a LUT exists.
+ assert(!g_currentLightTable->probeExpectedChanged);
+ auto retained=colors.back().rgba;colors.back().rgba^=1;
+ assert(g_currentLightTable->probeCpu.back().rgba==retained);
+ RememberPaletteProbeLightTable(*g_currentLightTable,colors.data());
+ assert(g_currentLightTable->probeExpectedChanged&&g_currentLightTable->probeCpu.back().rgba==colors.back().rgba);
  // Actual bytes, including mixed 253/254/255, survive selection and exact logging.
  Reset();UINT8 pixels[32]{};
  for(UINT8 channel:{253,254,255}){std::memset(pixels,0,32);pixels[12]=channel;pixels[13]=254;pixels[14]=255;pixels[15]=255;RememberPaletteProbeWhite(texture,pixels);assert(texture.paletteProbeWhite&&texture.paletteProbeX==3&&texture.paletteProbeY==0);assert(!std::memcmp(&texture.paletteProbeExpected,pixels+12,4));}
