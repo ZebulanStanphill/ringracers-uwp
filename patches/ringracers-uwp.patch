@@ -1,4 +1,4 @@
-From d854f42a75a2183edb7efaa36988b219f7794d5b Mon Sep 17 00:00:00 2001
+From f42132df57b2bd5b3b3cd55c60a6638ec74f80c1 Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -521,6 +521,9 @@ Model: gpt-6.1-sol
 
 Agent: Codex (Sol, D3D12 S6)
 Model: gpt-6.1-sol
+
+Agent: Claude Code (Opus, D3D12 S6 review)
+Model: claude-opus-5-5
 ---
  CMakeLists.txt                            |   19 +-
  CMakePresets.json                         |   17 +
@@ -557,7 +560,7 @@ Model: gpt-6.1-sol
  src/hardware/r_d3d11/shaders.hlsl         |  660 +++
  src/hardware/r_d3d12/allocators.h         |  196 +
  src/hardware/r_d3d12/d3d12_arenas.inc     |   94 +
- src/hardware/r_d3d12/d3d12_captures.inc   |  270 +
+ src/hardware/r_d3d12/d3d12_captures.inc   |  271 +
  src/hardware/r_d3d12/d3d12_core.cpp       |  845 +++
  src/hardware/r_d3d12/d3d12_core.h         |  140 +
  src/hardware/r_d3d12/d3d12_interop.cpp    |  558 ++
@@ -631,7 +634,7 @@ Model: gpt-6.1-sol
  src/w_wad.cpp                             |  312 +
  src/w_wad.h                               |   11 +
  src/z_zone.cpp                            |    5 +
- 109 files changed, 23192 insertions(+), 1127 deletions(-)
+ 109 files changed, 23193 insertions(+), 1127 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -14277,10 +14280,10 @@ index 0000000..b3b028d
 +}
 diff --git a/src/hardware/r_d3d12/d3d12_captures.inc b/src/hardware/r_d3d12/d3d12_captures.inc
 new file mode 100644
-index 0000000..4f6c8df
+index 0000000..304f980
 --- /dev/null
 +++ b/src/hardware/r_d3d12/d3d12_captures.inc
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,271 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// This program is free software distributed under the
@@ -14342,7 +14345,8 @@ index 0000000..4f6c8df
 +	Core_List()->SetGraphicsRootDescriptorTable(parameter, SrvGpu(texture.srv));
 +	g_stats.tableSets++;
 +}
-+// Allocate before copying: this can submit. Draw-time binding retags and restores it after other ring allocations.
++// Allocate before copying: this can submit. The draw supersedes this slot with a combined b0/capture
++// reservation, using the CPU snapshot below, then retags and restores it after other ring allocations.
 +bool SetPixelConstants(UINT parameter, const void *data, size_t size)
 +{
 +	UploadAllocation slot = g_constantRing.Alloc(256, 256);

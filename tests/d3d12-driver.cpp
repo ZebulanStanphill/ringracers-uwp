@@ -395,6 +395,66 @@ int main(int argc,char **argv) {
             if(negative=="water-group-counts") grouped=false;
             if(!grouped) { negativeRejected=negative=="water-group-counts"; throw std::runtime_error("grouped water copy/roundtrip oracle failed"); }
             expect("water-group",{80,120,158}); D3D12_FinishUpdate(0);
+            auto fog=surface({248,4,252}); fog.LightInfo.light_level=255; fog.LightInfo.fade_end=31;
+            auto captureQuad=quad(128.125f);
+            const FBITFIELD waterFlags=PF_Modulated|PF_ColorMapped|PF_Ripple|PF_Translucent|PF_NoDepthTest;
+            const FBITFIELD fogFlags=PF_Modulated|PF_ColorMapped|PF_Fog|PF_NoTexture|PF_NoDepthTest;
+            auto waterDraw=[&](UINT count=4) { texture(&water); shader(SHADER_WATER); polygon(&ws,captureQuad.data(),count,waterFlags); };
+            auto fogDraw=[&](UINT count=4) { shader(SHADER_FOG); polygon(&fog,captureQuad.data(),count,fogFlags); };
+            auto counts=[&]() { std::array<UINT64,3> result={}; D3D12_GetCaptureCountsForTest(&result[0],&result[1],&result[2]); return result; };
+            auto countDelta=[&](const char *scene,std::array<UINT64,3> before,UINT64 fogCount,UINT64 waterCount) {
+                auto after=counts(); bool correct=after[0]-before[0]==fogCount && after[1]-before[1]==waterCount && after[2]-before[2]==waterCount;
+                if(negative==scene) correct=false;
+                if(!correct) { negativeRejected=negative==scene; throw std::runtime_error("capture copy/roundtrip delta failed"); }
+            };
+            bool mixedSameList=false;
+            for(int attempt=0;attempt<4 && !mixedSameList;attempt++) {
+                reset({80,120,160}); auto mixedBefore=counts();
+                waterDraw(); UINT64 pending=Core_PendingFence(); fogDraw();
+                mixedSameList=Core_PendingFence()==pending;
+                countDelta("capture-mixed",mixedBefore,1,1); expect("capture-mixed",{80,120,159});
+                // Shift the constant-ring head after a split pair; otherwise its next wrap can
+                // repeat at the same point in every attempt. The next reset discards this draw.
+                if(!mixedSameList) { function<void (*)()>("UnSetShader")(); draw({24,180,220},PF_NoDepthTest); }
+            }
+            if(!mixedSameList) throw std::runtime_error("mixed captures never shared a command list");
+            D3D12_FinishUpdate(0);
+
+            // Flush while both captured textures are referenced by recorded draws. Continuing the old
+            // grouped run must capture afresh, rather than retaining its retired snapshot or ready flag.
+            reset({80,120,160}); special(HWD_SET_WATER_SURFACE,1); waterDraw(); fogDraw();
+            function<void (*)()>("FlushScreenTextures")();
+            auto recreateBefore=counts(); reset({40,80,120}); special(HWD_SET_WATER_SURFACE,2);
+            waterDraw(); fogDraw(); countDelta("capture-recreate",recreateBefore,1,1);
+            expect("capture-recreate",{40,80,120}); D3D12_FinishUpdate(0);
+            // Actual size changes replace both capture allocations. Keep a grouped run ready across
+            // each Surface call and verify that state 2 still reads the new target's known color.
+            auto clip=function<void (*)(INT32,INT32,INT32,INT32,float)>("GClipRect");
+            for(int size:{128,64}) {
+                special(HWD_SET_WATER_SURFACE,1); waterDraw(); fogDraw();
+                if(!D3D12_Surface(size,size)) throw std::runtime_error("capture resize failed");
+                clip(0,0,size,size,.1f); reset({40,80,120}); special(HWD_SET_WATER_SURFACE,2);
+                recreateBefore=counts(); waterDraw(); fogDraw(); countDelta("capture-recreate",recreateBefore,1,1);
+                RGB actual=probe(size/2,size/2,size),want={40,80,120};
+                if(negative=="capture-recreate") want[0]+=67;
+                for(int c=0;c<3;c++) if(abs(actual[c]-want[c])>1) { negativeRejected=negative=="capture-recreate"; throw std::runtime_error("capture pixel after resize failed"); }
+                validate(validationQueue); D3D12_FinishUpdate(0);
+            }
+            special(HWD_SET_WATER_SURFACE,0);
+
+            // PreparePolygon captures these two diagonal vertices, but a two-vertex fan never
+            // draws. Repeated water/fog pairs exercise coalescing of still-pending transitions.
+            reset({80,120,160}); auto skippedBefore=counts(); bool sameList=false;
+            auto fullQuad=captureQuad; captureQuad[1]=captureQuad[2];
+            for(int pair=0;pair<8;pair++) {
+                UINT64 pending=Core_PendingFence(); waterDraw(2); fogDraw(2);
+                if(Core_PendingFence()==pending) sameList=true;
+            }
+            captureQuad=fullQuad; waterDraw(); fogDraw();
+            bool skippedCorrect=sameList;
+            if(negative=="capture-skipped") skippedCorrect=false;
+            if(!skippedCorrect) { negativeRejected=negative=="capture-skipped"; throw std::runtime_error("skipped captures did not share a pending command list"); }
+            countDelta("capture-skipped",skippedBefore,9,9); expect("capture-skipped",{80,120,159}); D3D12_FinishUpdate(0);
             deleteTexture(&water); function<void (*)()>("UnSetShader")(); special(HWD_SET_SHADERS,HWD_SHADEROPTION_OFF);
         }
         const RGB tl={200,40,16}, tr={16,64,224}, bl={32,200,64}, br={232,216,24}; // quadrants of the screen the copies hold
