@@ -1,4 +1,4 @@
-From 4d3f67e33ebe93cb20b4a06a23836031b1f8961e Mon Sep 17 00:00:00 2001
+From 5aa10f1053d9086163333174e62d80d2470a9cf0 Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -596,6 +596,15 @@ Agent: Codex (Sol, device validation documentation)
 Model: gpt-6.1-sol
 Agent: Claude Code (Haiku, device validation documentation)
 Model: claude-haiku-5-5
+
+- [UWP]: Place every Direct3D 12 texture with 64 KB alignment, turning off
+  4 KB small placement. On Xbox, the palette probe found a light table whose
+  first row read back as zero on the GPU while its last row was intact, until
+  the light tables were recreated, which matches a neighboring texture
+  overrunning a 4 KB-aligned placement.
+
+Agent: Claude Code (Opus, D3D12 placement diagnosis)
+Model: claude-opus-5-5
 ---
  CMakeLists.txt                              |   19 +-
  CMakePresets.json                           |   17 +
@@ -652,7 +661,7 @@ Model: claude-haiku-5-5
  src/hardware/r_d3d12/d3d12_upload.h         |   54 +
  src/hardware/r_d3d12/mips.h                 |   60 +
  src/hardware/r_d3d12/pipeline_key.h         |   51 +
- src/hardware/r_d3d12/r_d3d12.cpp            | 3026 +++++++++
+ src/hardware/r_d3d12/r_d3d12.cpp            | 3029 +++++++++
  src/hardware/r_d3d12/r_d3d12.h              |   61 +
  src/hardware/r_d3d12/texture_repack.h       |   36 +
  src/hardware/r_opengl/r_opengl.c            |  308 +-
@@ -710,7 +719,7 @@ Model: claude-haiku-5-5
  src/w_wad.cpp                               |  312 +
  src/w_wad.h                                 |   11 +
  src/z_zone.cpp                              |    5 +
- 113 files changed, 23959 insertions(+), 1137 deletions(-)
+ 113 files changed, 23962 insertions(+), 1137 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -20795,10 +20804,10 @@ index 0000000..736f77d
 +#endif
 diff --git a/src/hardware/r_d3d12/r_d3d12.cpp b/src/hardware/r_d3d12/r_d3d12.cpp
 new file mode 100644
-index 0000000..12fadc8
+index 0000000..674378f
 --- /dev/null
 +++ b/src/hardware/r_d3d12/r_d3d12.cpp
-@@ -0,0 +1,3026 @@
+@@ -0,0 +1,3029 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// Copyright (C) 2025 by Kart Krew.
@@ -21704,7 +21713,10 @@ index 0000000..12fadc8
 +	// Thin textures can exceed sixteen 4 KB tiles even when their raw bytes fit.
 +	const UINT tileSize = desc.Format == DXGI_FORMAT_R8_UNORM ? 64
 +		: (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R32_SINT) ? 32 : 0;
-+	const bool smallEligible = tileSize && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
++	// [UWP]: Off for now. On Xbox, a light table placed with 4 KB alignment lost its first rows to a neighbor while
++	// its last row stayed intact, which recreating it elsewhere cured; every texture gets 64 KB alignment instead.
++	constexpr bool kSmallPlacement = false;
++	const bool smallEligible = kSmallPlacement && tileSize && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
 +		&& desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1
 +		&& desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN
 +		&& !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
