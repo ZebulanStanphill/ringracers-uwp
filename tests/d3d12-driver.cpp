@@ -1,3 +1,9 @@
+// DR. ROBOTNIK'S RING RACERS
+//-----------------------------------------------------------------------------
+// This program is free software distributed under the
+// terms of the GNU General Public License, version 2.
+// See the 'LICENSE' file for more details.
+//-----------------------------------------------------------------------------
 // Runs the production driver and GPU code; only engine services and ANGLE presentation are stubbed.
 #include "hardware/r_d3d12/d3d12_core.h"
 #include "hardware/r_d3d12/d3d12_present.h"
@@ -25,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "t_fsin.c"
 #undef min
 #undef max
 #undef clamp
@@ -49,6 +56,7 @@ size_t W_LumpLength(lumpnum_t) { return lumpBytes.size(); }
 void W_ReadLump(lumpnum_t, void *d) { memcpy(d,lumpBytes.data(),lumpBytes.size()); }
 consvar_t cv_gld3d12{}, cv_vidwait{}, cv_reducevfx{};
 CV_PossibleValue_t glanisotropicmode_cons_t[] = {{0, "Off"}, {16, "16"}, {0, nullptr}};
+INT32 R_AdjustLightLevel(INT32 light) { return light; }
 void HWR_Startup() {}
 void CV_StealthSet(consvar_t *, const char *) {}
 void M_SaveConfig(const char *) {}
@@ -256,6 +264,26 @@ int main(int argc,char **argv) {
             expect("light-table-update",oldColor,18,32); expect("light-table-update",newColor,46,32);
             expectPost("light-table-update-post",index19,18,32); expectPost("light-table-update-post",index7,46,32);
             D3D12_FinishUpdate(0);
+            // Palette fog chooses the captured scene index and Software's integer distance row.
+            for(bool plane:{false,true}) {
+                const float distance=128.125f; const int lightnum=12;
+                int attenuation=plane?(160/((int)(distance/16)+1))/2:std::min((int)(5120/distance),47)/2;
+                int row=std::clamp((31-lightnum)*2-attenuation,0,31);
+                lightTable.assign(256*33,rgba({252,12,244}));
+                const RGB remapped={20+row*5,210-row*3,48+row*2};
+                lightTable[row*256+7]=rgba(remapped); updateLightTable(lightId,lightTable.data());
+                // Draw scenery with shaders off so its RGB is exactly the LUT's index 7 color.
+                function<void (*)()>("UnSetShader")(); reset({24,180,220}); setShader(SHADER_FOG);
+                auto fog=surface({248,4,252},128); fog.LightTableId=lightId;
+                fog.LightInfo.light_level=lightnum*8; fog.LightInfo.fade_end=31;
+                auto q=quad(distance);
+                polygon(&fog,q.data(),4,PF_Modulated|PF_ColorMapped|PF_Fog|PF_NoTexture|PF_NoDepthTest|(plane?PF_FogPlane:0));
+                expect("fog-palette",remapped);
+                expect("fog-palette",{24,180,220},2,2);
+                D3D12_FinishUpdate(0);
+            }
+            // Restore the table and shader for the lifetime scenes below.
+            lightTable.assign(256*33,rgba({252,12,244})); setShader(SHADER_FLOOR);
             // c) Clear and remake the table every frame, so its views and resources are retired while recorded work uses them,
             // and descriptors come back after the fence.
             UINT64 placedBefore=0,blocksBefore=0,srvsBefore=0; D3D12_GetReuseCountsForTest(&placedBefore,&blocksBefore,&srvsBefore);
@@ -289,6 +317,85 @@ int main(int argc,char **argv) {
             clearLightTables(); deleteTexture(&paletteTexture);
             function<void (*)()>("UnSetShader")(); special(HWD_SET_SHADERS,HWD_SHADEROPTION_OFF);
             validate(validationQueue);
+        }
+        // Explicit fog boundaries composite the captured scenery, irrespective of polygon color.
+        {
+            auto shader=function<void (*)(int)>("SetShader");
+            special(HWD_SET_SHADERS,HWD_SHADEROPTION_ON); function<void (*)()>("UnSetShader")();
+            const RGB colors[]={{200,40,16},{16,64,224},{32,200,64},{232,216,24}};
+            quadrants(colors[0],colors[1],colors[2],colors[3]); shader(SHADER_FOG);
+            auto fog=surface({252,4,248},128); fog.LightInfo.light_level=255; fog.LightInfo.fade_end=31;
+            fog.TintColor.s.red=51; fog.TintColor.s.green=76; fog.TintColor.s.blue=128; fog.TintColor.s.alpha=10;
+            auto q=quad(128.125f);
+            polygon(&fog,q.data(),4,PF_Modulated|PF_ColorMapped|PF_Fog|PF_NoTexture|PF_NoDepthTest);
+            auto image=pixels(); validate(validationQueue);
+            for(int i=0;i<4;i++) {
+                double brightness=std::sqrt(double(colors[i][0]*colors[i][0]+colors[i][1]*colors[i][1]+colors[i][2]*colors[i][2]));
+                double strength=std::sqrt(9.*10/255); RGB want={}; const int tint[]={51,76,128};
+                for(int c=0;c<3;c++) want[c]=(int)std::lround(std::clamp(brightness*tint[c]/255*strength+colors[i][c]*(1-strength),0.,255.));
+                check("fog-remap",image,(i&1)?44:20,(i&2)?44:20,want);
+            }
+            function<void (*)()>("UnSetShader")(); special(HWD_SET_SHADERS,HWD_SHADEROPTION_OFF); D3D12_FinishUpdate(0);
+        }
+        // Water surface UV distortion and scene refraction use separate D3D11 equations.
+        {
+            auto shader=function<void (*)(int)>("SetShader");
+            auto shaderInfo=function<void (*)(hwdshaderinfo_t,INT32)>("SetShaderInfo");
+            special(HWD_SET_SHADERS,HWD_SHADEROPTION_ON); shader(SHADER_WATER);
+            std::vector<UINT8> stripe(64*4);
+            for(int y=0;y<64;y++) { stripe[y*4]=UINT8(y*3); stripe[y*4+1]=UINT8(240-y*3); stripe[y*4+2]=64; stripe[y*4+3]=255; }
+            GLMipmap_t water={}; water.format=GL_TEXFMT_RGBA; water.width=1; water.height=64; water.data=stripe.data();
+            texture(&water);
+            auto ws=surface({255,255,255}); ws.LightInfo.light_level=255; ws.LightInfo.fade_end=31;
+            const float z=128.125f; auto q=quad(z); q[0].t=q[1].t=0; q[2].t=q[3].t=1;
+            for(int tick:{0,6,41,128}) {
+                shaderInfo(HWD_SHADERINFO_LEVELTIME,tick); reset();
+                polygon(&ws,q.data(),4,PF_Modulated|PF_ColorMapped|PF_Ripple|PF_NoDepthTest);
+                auto image=pixels(); validate(validationQueue);
+                for(int y:{20,32,44}) {
+                    // Production perspective remaps clip Z to D3D; PSWater then divides fragz by two.
+                    float fragz=(z-.1f)*32768.f/(32768.f-.1f);
+                    float v=(57.6f-(y+.5f))/51.2f-std::cos(-3.14159f*(fragz/2*.025f)+tick/35.f*2)*.025f;
+                    int row=((int)std::floor(v*64)%64+64)%64;
+                    check("water-surface",image,32,y,{row*3,240-row*3,64});
+                }
+            }
+            deleteTexture(&water);
+            std::array<UINT8,4> transparent={0,0,0,1}; water.height=1; water.data=transparent.data(); texture(&water);
+            for(float distance:{32.125f,128.125f,512.125f}) for(int tick:{0,6,41,128}) {
+                function<void (*)()>("UnSetShader")();
+                reset({0,0,0});
+                for(int y=0;y<64;y++) fillRect(-1,1,1-(y+1)/32.f,1-y/32.f,{y*3,240-y*3,64});
+                texture(&water); shader(SHADER_WATER); shaderInfo(HWD_SHADERINFO_LEVELTIME,tick); auto wq=quad(distance);
+                polygon(&ws,wq.data(),4,PF_Modulated|PF_ColorMapped|PF_Ripple|PF_Translucent|PF_NoDepthTest);
+                auto image=pixels(); validate(validationQueue);
+                int angle=(tick*140+(int)std::floor(distance*128))&8191;
+                int shift=(int)std::floor(double(finesine[angle])/(4096+std::floor(distance*32)));
+                for(int y:{20,32,44}) { int row=std::clamp(y+shift,0,63); check("water-refraction",image,32,y,{(int)std::lround(row*3*254./255),(int)std::lround((240-row*3)*254./255),64}); }
+                D3D12_FinishUpdate(0);
+            }
+            // Nested coplanar faces reuse the run's first capture; a second run gets a fresh one.
+            // Tiny constant/geometry rings may submit between these draws, exercising capture lifetime.
+            reset({80,120,160}); shaderInfo(HWD_SHADERINFO_LEVELTIME,6);
+            UINT64 fogBefore=0,copiesBefore=0,tripsBefore=0;
+            D3D12_GetCaptureCountsForTest(&fogBefore,&copiesBefore,&tripsBefore);
+            for(int run=0;run<2;run++) {
+                special(HWD_SET_WATER_SURFACE,1);
+                for(int face=0;face<8;face++) {
+                    if(face) special(HWD_SET_WATER_SURFACE,2);
+                    auto nested=quad(128.125f); float scale=1-face*.025f;
+                    for(auto &vertex:nested) { vertex.x*=scale; vertex.y*=scale; }
+                    polygon(&ws,nested.data(),4,PF_Modulated|PF_ColorMapped|PF_Ripple|PF_Translucent|PF_NoDepthTest);
+                }
+            }
+            special(HWD_SET_WATER_SURFACE,0);
+            UINT64 fogAfter=0,copiesAfter=0,tripsAfter=0;
+            D3D12_GetCaptureCountsForTest(&fogAfter,&copiesAfter,&tripsAfter);
+            bool grouped=copiesAfter-copiesBefore==2 && tripsAfter-tripsBefore==2;
+            if(negative=="water-group-counts") grouped=false;
+            if(!grouped) { negativeRejected=negative=="water-group-counts"; throw std::runtime_error("grouped water copy/roundtrip oracle failed"); }
+            expect("water-group",{80,120,158}); D3D12_FinishUpdate(0);
+            deleteTexture(&water); function<void (*)()>("UnSetShader")(); special(HWD_SET_SHADERS,HWD_SHADEROPTION_OFF);
         }
         const RGB tl={200,40,16}, tr={16,64,224}, bl={32,200,64}, br={232,216,24}; // quadrants of the screen the copies hold
         // Screen textures: copies of the screen, drawn back as the intermission background and the final screen
@@ -565,7 +672,7 @@ int main(int argc,char **argv) {
         { unsigned alive=9,uploads=0; int created=0,updated=0; double passes=0,ms=0; auto pp=logs.find("UWP perf:   D3D12: palette: rendering ");
           if(pp==std::string::npos) throw std::runtime_error("missing palette perf line");
           if(sscanf(logs.c_str()+pp,"UWP perf:   D3D12: palette: rendering %*s %u light tables alive, %d created, %d updated; %u LUT/palette uploads; %lf post passes per frame, %lf ms per frame",&alive,&created,&updated,&uploads,&passes,&ms)!=6
-             || alive!=0 || created!=98 || updated!=1 || uploads<6 || passes<=0) throw std::runtime_error("palette perf counters are wrong"); }
+             || alive!=0 || created!=98 || updated!=3 || uploads<6 || passes<=0) throw std::runtime_error("palette perf counters are wrong"); }
         { int full=0,twoPass=0,images=0,fades=0,fallbacks=0; auto sp=logs.find("UWP perf:   D3D12: screens: ");
           if(sp==std::string::npos) throw std::runtime_error("missing screens perf line");
           if(sscanf(logs.c_str()+sp,"UWP perf:   D3D12: screens: %*f per frame (%*f copies, %*f barriers); wipes %d full, %d two-pass; post image %d; fade maps %d drawn, %d left to the overlay",&full,&twoPass,&images,&fades,&fallbacks)!=5

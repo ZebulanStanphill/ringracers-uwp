@@ -218,8 +218,21 @@ recorded draws still use it, and requires descriptors to be reused after their f
 `screen-palette` changes the screen palette between frames, and `palette-off` checks that
 the last step doesn't run with Palette Rendering off. The master palette's creation and
 removal run under GPU-based validation, and the `palette:` perf line's counters are
-checked; the fade map scenes below are what read the master palette. Fog and water with
-palette rendering, and Xbox colors, remain untested here.
+checked; the fade map scenes below are what read the master palette. Fog remapping with
+palette rendering is covered below; water with palette rendering and Xbox colors remain
+untested here.
+Fog and water scenes run the production capture path with the same tiny rings, so command-list
+submissions exercise rebinding and constant lifetimes. Fog draws over known scenery, including
+palette remapping through a light table. Water checks ordinary surface sampling and captured-scene
+refraction against the fixed-point sine and D3D11 blend math; grouped surfaces must keep their
+original captured background while later pieces draw. The `fog-remap`, `fog-palette`, `water-
+surface`, `water-refraction`, `water-group` and `water-group-counts` negative controls must each
+fail their oracle, and capture counters check the grouping under GPU-based validation. Native D3D12
+capture tests mock the texture, copy, binding and constant helpers, checking D3D11's bounds and
+constants, split views, clipping, failures, resizing and disjoint water growth. A growing water
+capture uses one batched transition round trip around up to four strips; an unchanged grouped
+rectangle uses none. Xbox visual results, render-target decompression cost and performance remain
+untested.
 Screen scenes draw a screen of four colored quadrants, copy it, clear the screen and
 draw the copy back. `screen-copy` does so with the intermission background, which must
 reproduce every quadrant; `final-screen` draws the final screen into a viewport twice
