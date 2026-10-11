@@ -1,4 +1,4 @@
-From f42132df57b2bd5b3b3cd55c60a6638ec74f80c1 Mon Sep 17 00:00:00 2001
+From e6761a6bc4ff8fdcf9def43abe8fabb9ee476e40 Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -524,6 +524,13 @@ Model: gpt-6.1-sol
 
 Agent: Claude Code (Opus, D3D12 S6 review)
 Model: claude-opus-5-5
+
+S6 regression scenes restore the palette texture after fog's PF_NoTexture
+unbind before continuing the palette lifetime checks. Capture tests also cover
+mixed command lists, skipped draws, and texture recreation after flush/resize.
+
+Agent: Codex (Sol, D3D12 S6)
+Model: gpt-6.1-sol
 ---
  CMakeLists.txt                            |   19 +-
  CMakePresets.json                         |   17 +

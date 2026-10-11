@@ -231,8 +231,12 @@ fail their oracle, and capture counters check the grouping under GPU-based valid
 capture tests mock the texture, copy, binding and constant helpers, checking D3D11's bounds and
 constants, split views, clipping, failures, resizing and disjoint water growth. A growing water
 capture uses one batched transition round trip around up to four strips; an unchanged grouped
-rectangle uses none. Xbox visual results, render-target decompression cost and performance remain
-untested.
+rectangle uses none. `capture-mixed` requires fog and water in the same command list;
+`capture-recreate` checks capture replacement after flushing resources still referenced by
+recorded draws and after a resize; `capture-skipped` skips two-vertex fans after capture
+and checks the next capture/draw, including pending opposite-transition merging. Each has
+a negative control. Xbox visual results, render-target decompression cost and performance
+remain untested.
 Screen scenes draw a screen of four colored quadrants, copy it, clear the screen and
 draw the copy back. `screen-copy` does so with the intermission background, which must
 reproduce every quadrant; `final-screen` draws the final screen into a viewport twice

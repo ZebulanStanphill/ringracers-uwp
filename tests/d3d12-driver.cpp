@@ -283,7 +283,7 @@ int main(int argc,char **argv) {
                 D3D12_FinishUpdate(0);
             }
             // Restore the table and shader for the lifetime scenes below.
-            lightTable.assign(256*33,rgba({252,12,244})); setShader(SHADER_FLOOR);
+            lightTable.assign(256*33,rgba({252,12,244})); texture(&paletteTexture); setShader(SHADER_FLOOR);
             // c) Clear and remake the table every frame, so its views and resources are retired while recorded work uses them,
             // and descriptors come back after the fence.
             UINT64 placedBefore=0,blocksBefore=0,srvsBefore=0; D3D12_GetReuseCountsForTest(&placedBefore,&blocksBefore,&srvsBefore);
