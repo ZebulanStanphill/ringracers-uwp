@@ -30,6 +30,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${RR_SOURCE_DIR}/src/hardware/r_d3d11/r_d3d11.cpp"
     "${RR_SOURCE_DIR}/src/hardware/r_d3d12/r_d3d12.cpp"
     "${RR_SOURCE_DIR}/src/hardware/r_d3d12/d3d12_captures.inc"
+    "${RR_SOURCE_DIR}/src/hardware/r_d3d12/d3d12_paletteprobe.inc"
+    "${RR_SOURCE_DIR}/src/hardware/r_d3d12/d3d12_palette.inc"
     "${RR_SOURCE_DIR}/src/menus/options-1.c"
     "${RR_SOURCE_DIR}/src/d_main.cpp"
     "${RR_SOURCE_DIR}/src/hardware/hw_main.c"
@@ -94,6 +96,7 @@ regression(water_visibility water_visibility HWRENDER)
 regression(water_blend_state blend _UWP)
 regression(fog_boundaries fog HWRENDER _UWP)
 regression(fog_capture fog_capture _UWP)
+regression(paletteprobe_d3d12 paletteprobe_d3d12 _UWP)
 regression(fog_capture_d3d12 fog_capture_d3d12 _UWP)
 regression(water_capture_d3d12 water_capture_d3d12 _UWP)
 regression(sky_offsets sky)

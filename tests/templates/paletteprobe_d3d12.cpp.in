@@ -1,0 +1,83 @@
+// Native contract mocks; actual D3D12 execution requires Windows WARP.
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <map>
+#include <vector>
+#include <string>
+#include <functional>
+#include <cstdio>
+using UINT=unsigned; using UINT8=uint8_t; using UINT32=uint32_t; using UINT64=uint64_t; using SIZE_T=size_t;
+union RGBA_t { UINT32 rgba; struct {UINT8 red,green,blue,alpha;} s; };
+constexpr UINT D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT=512,D3D12_TEXTURE_DATA_PITCH_ALIGNMENT=256,HWR_PALETTE_LUT_SIZE=64;
+enum {D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,D3D12_RESOURCE_STATE_COPY_SOURCE=10,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_DIMENSION_BUFFER,D3D12_TEXTURE_LAYOUT_ROW_MAJOR,D3D12_HEAP_FLAG_NONE};
+struct D3D12_RANGE {size_t Begin,End;}; struct D3D12_BOX {UINT left,top,front,right,bottom,back;};
+struct D3D12_HEAP_PROPERTIES {int Type;};
+struct D3D12_RESOURCE_DESC {int Dimension{}; UINT64 Width{}; UINT Height{},DepthOrArraySize{},MipLevels{}; struct {UINT Count{};} SampleDesc; int Layout{};};
+static int failure, allocations,maps,unmaps,flushes,submits,waits,live; static UINT64 pending=7,retireFence; static bool completed,cacheValid=true; static std::vector<std::string> events;
+struct ID3D12Resource {std::vector<UINT8> bytes; UINT width=256,height=33; UINT8 value=0; ID3D12Resource(){++live;} ~ID3D12Resource(){--live;} int Map(UINT,const D3D12_RANGE *r,void **out){++maps;assert(completed&&r->Begin==0&&r->End==2560);if(failure==4)return 1;*out=bytes.data();return 0;} void Unmap(UINT,const D3D12_RANGE*r){++unmaps;assert(!r->Begin&&!r->End);} };
+template<class T> struct ComPtr {std::shared_ptr<T> p; T*Get()const{return p.get();} T*operator->()const{return Get();} explicit operator bool()const{return bool(p);} };
+#define IID_PPV_ARGS(x) (x)
+struct GpuTexture {ComPtr<ID3D12Resource> res; int format=4,state=3;};
+struct Texture:GpuTexture {RGBA_t paletteProbeExpected{};bool paletteProbeWhite=true;UINT paletteProbeX=2,paletteProbeY=1,width=4,height=2,mips=1,id=1;};
+struct LightTable:GpuTexture {RGBA_t probeWhite[2]{};UINT8 probeWhiteColumn=0;bool probeWhiteValid=false;};
+static GpuTexture g_paletteLookup,g_screenPalette; static std::map<UINT,LightTable> g_lightTables; static LightTable*g_currentLightTable; static Texture*g_units[1];
+static bool g_paletteProbePending,g_paletteRendering=true,g_postImage,g_waterRefraction,g_fogRemap,g_paletteProbeLutValid=true; static UINT g_paletteProbeDraws,g_paletteProbeLutWhite;static const char*g_paletteProbeSkip; static RGBA_t g_palette[32]{},g_screenPaletteColors[256]{},*pMasterPalette;
+constexpr UINT PF_ColorMapped=1; static UINT g_currentPolyFlags;
+enum Layout {LAYOUT_POLY,LAYOUT_OTHER}; enum {SHADER_FLOOR,SHADER_WALL,SHADER_SPRITE,SHADER_SPRITECLIPHACK,SHADER_OTHER}; static int g_program; static struct {bool texture2D=true;}g_gl;
+struct D3D12_TEXTURE_COPY_LOCATION {ID3D12Resource*pResource{};int Type{};struct {UINT64 Offset{};struct {int Format;UINT Width,Height,Depth,RowPitch;}Footprint;}PlacedFootprint;};
+struct Copy {D3D12_BOX box;UINT64 offset;ID3D12Resource*source;};static std::vector<Copy> copies;static std::vector<std::function<void()>> queued;static std::vector<int> transitions;
+static void Transition(GpuTexture&t,int s){transitions.push_back(s);t.state=s;}
+static void Core_FlushBarriers(){++flushes;}
+struct List {void CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION*to,UINT x,UINT y,UINT z,const D3D12_TEXTURE_COPY_LOCATION*from,const D3D12_BOX*b){assert(!x&&!y&&!z);assert(to->Type==D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT&&from->Type==D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX);auto f=to->PlacedFootprint.Footprint;assert(f.Width==1&&f.Height==1&&f.Depth==1&&f.RowPitch==256);assert(b->right==b->left+1&&b->bottom==b->top+1&&b->back==b->front+1);copies.push_back({*b,to->PlacedFootprint.Offset,from->pResource});auto source=from->pResource;auto dest=to->pResource;auto offset=to->PlacedFootprint.Offset;auto box=*b;queued.push_back([source,dest,offset,f,box]{if(source->bytes.empty()) std::memset(dest->bytes.data()+offset,UINT8(source->value+(box.top==32)),f.Format);else std::memcpy(dest->bytes.data()+offset,source->bytes.data()+((box.front*source->height+box.top)*source->width+box.left)*f.Format,f.Format);});}};
+static List*Core_List(){static List list;return &list;}
+struct Device {int CreateCommittedResource(const D3D12_HEAP_PROPERTIES*h,int,const D3D12_RESOURCE_DESC*d,int s,void*,ComPtr<ID3D12Resource>*out){++allocations;assert(h->Type==D3D12_HEAP_TYPE_READBACK&&s==D3D12_RESOURCE_STATE_COPY_DEST&&d->Width==2560&&d->Height==1&&d->SampleDesc.Count==1);if(failure==1)return 1;out->p=std::make_shared<ID3D12Resource>();out->p->bytes.assign(d->Width,0xee);return 0;}};
+static Device*Core_Device(){static Device d;return &d;} static bool Core_Failed(int hr,const char*){return hr!=0;}
+static std::vector<ComPtr<ID3D12Resource>> retired;
+static void Core_Retire(ComPtr<ID3D12Resource>&r){retireFence=pending;retired.push_back(r);r.p.reset();events.push_back("retire");}
+static UINT64 Core_Submit(const char*s){assert(std::string(s)=="probe");++submits;events.push_back("submit");assert(g_paletteLookup.state==3&&g_screenPalette.state==4&&g_currentLightTable->state==5&&g_units[0]->state==6);cacheValid=false;UINT64 f=pending++;if(failure!=2){for(auto &work:queued)work();queued.clear();}return failure==2?0:f;}
+static bool Core_Wait(UINT64 f,UINT timeout,const char*s){++waits;assert(f==retireFence&&timeout==500&&std::string(s)=="paletteprobe");completed=failure!=3;return completed;}
+static std::vector<std::string> logs;template<class...T>void Log(const char*s,T...args){char out[2048];std::snprintf(out,sizeof out,s,args...);logs.push_back(out);}
+@@PROBE@@
+@@REMEMBER@@
+static Texture texture;
+static void Reset(){queued.clear();retired.clear();texture.res.p=std::make_shared<ID3D12Resource>();g_paletteLookup.res.p=std::make_shared<ID3D12Resource>();g_screenPalette.res.p=std::make_shared<ID3D12Resource>();g_lightTables.clear();g_currentLightTable=&g_lightTables[9];g_currentLightTable->res.p=std::make_shared<ID3D12Resource>();g_paletteLookup.res->value=1;g_screenPalette.res->value=2;g_currentLightTable->res->value=3;texture.res->value=5;g_paletteLookup.format=1;g_paletteLookup.state=3;g_screenPalette.state=4;g_currentLightTable->state=5;texture.state=6;texture.paletteProbeWhite=true;texture.paletteProbeX=2;texture.paletteProbeY=1;g_units[0]=&texture;g_paletteProbePending=true;g_paletteProbeDraws=0;g_paletteProbeLutWhite=0;g_paletteRendering=g_paletteProbeLutValid=g_gl.texture2D=true;g_postImage=g_waterRefraction=g_fogRemap=false;g_program=SHADER_FLOOR;g_currentPolyFlags=PF_ColorMapped;failure=allocations=maps=unmaps=flushes=submits=waits=0;completed=false;cacheValid=true;copies.clear();events.clear();transitions.clear();logs.clear();}
+int main(){
+ Reset();RGBA_t samples[5]{};assert(!ReadPaletteProbe(texture,samples));assert(copies.size()==5&&transitions.size()==10&&flushes==6);const UINT coords[5][3]={{63,63,63},{0,0,0},{0,0,0},{0,32,0},{2,1,0}};for(UINT i=0;i<5;++i){assert(copies[i].offset==i*512);auto b=copies[i].box;assert(b.left==coords[i][0]&&b.top==coords[i][1]&&b.front==coords[i][2]);assert(transitions[2*i]==D3D12_RESOURCE_STATE_COPY_SOURCE);assert(transitions[2*i+1]==(i==0?3:i==1?4:i==4?6:5));assert(samples[i].rgba==(i==0?1:UINT32(i+1)*0x01010101));}assert(copies[0].source==g_paletteLookup.res.Get()&&copies[1].source==g_screenPalette.res.Get()&&copies[2].source==g_currentLightTable->res.Get()&&copies[3].source==copies[2].source&&copies[4].source==texture.res.Get());assert(events==std::vector<std::string>({"retire","submit"})&&!cacheValid&&maps==1&&unmaps==1);retired.clear();assert(live==4);
+ Reset();texture.res->value=17;queued.push_back([]{texture.res->value=255;events.push_back("upload");});assert(!ReadPaletteProbe(texture,samples));assert(samples[4].rgba==0xffffffff&&events==std::vector<std::string>({"retire","submit","upload"})&&completed&&maps==1);
+ for(int f=1;f<=4;++f){Reset();failure=f;MaybePaletteProbe(LAYOUT_POLY,false);assert(!g_paletteProbePending&&allocations==1);assert(maps==(f==4)&&unmaps==0);assert(submits==(f!=1)&&waits==(f>=3));assert(retired.size()==size_t(f!=1)&&live==(f==1?4:5));if(f!=1)assert(retireFence==pending-1);retired.clear();assert(live==4);MaybePaletteProbe(LAYOUT_POLY,false);assert(allocations==1);}
+ for(int program:{SHADER_FLOOR,SHADER_WALL,SHADER_SPRITE,SHADER_SPRITECLIPHACK}){Reset();g_program=program;MaybePaletteProbe(LAYOUT_POLY,false);assert(!g_paletteProbePending&&maps==1);MaybePaletteProbe(LAYOUT_POLY,false);assert(maps==1);}
+ Reset();g_paletteProbePending=false;MaybePaletteProbe(LAYOUT_POLY,false);assert(!allocations&&!flushes&&!submits&&!waits&&!maps&&!g_paletteProbeDraws);
+ for(int bad=0;bad<17;++bad){Reset();Layout layout=LAYOUT_POLY;bool wipe=false;switch(bad){case 0:g_paletteRendering=false;break;case 1:layout=LAYOUT_OTHER;break;case 2:wipe=true;break;case 3:g_postImage=true;break;case 4:g_waterRefraction=true;break;case 5:g_fogRemap=true;break;case 6:g_program=SHADER_OTHER;break;case 7:g_gl.texture2D=false;break;case 8:g_paletteProbeLutValid=false;break;case 9: texture.paletteProbeWhite=false;break;case 10:g_currentLightTable=nullptr;break;case 11:g_paletteLookup.res.p.reset();break;case 12:g_screenPalette.res.p.reset();break;case 13:g_units[0]=nullptr;break;case 14:texture.res.p.reset();break;case 15:g_currentLightTable->res.p.reset();break;case 16:g_currentPolyFlags=0;break;}for(int i=0;i<4095;++i)MaybePaletteProbe(layout,wipe);assert(g_paletteProbePending&&!allocations);MaybePaletteProbe(layout,wipe);assert(!g_paletteProbePending&&g_paletteProbeDraws==4096&&!allocations&&!flushes&&!submits&&!waits&&!maps);}
+ // Retained light-table and white-texture bindings do not make an uncolormapped draw eligible.
+ Reset();g_currentPolyFlags=0;MaybePaletteProbe(LAYOUT_POLY,false);assert(g_paletteProbePending&&g_paletteProbeDraws==1&&!allocations&&!flushes&&!submits&&!waits&&!maps);g_currentPolyFlags=PF_ColorMapped;MaybePaletteProbe(LAYOUT_POLY,false);assert(!g_paletteProbePending&&g_paletteProbeDraws==2&&allocations==1&&maps==1);
+ Reset();texture.paletteProbeWhite=false;MaybePaletteProbe(LAYOUT_POLY,false);auto skip=g_paletteProbeSkip;g_program=SHADER_OTHER;MaybePaletteProbe(LAYOUT_POLY,false);assert(g_paletteProbeSkip==skip&&!allocations);
+ Reset();LightTable foreign;foreign.res.p=std::make_shared<ID3D12Resource>();g_currentLightTable=&foreign;MaybePaletteProbe(LAYOUT_POLY,false);assert(!g_paletteProbePending&&!allocations);
+
+ // A nonzero LUT corner selects actual distinct columns in screen/table resources.
+ Reset();g_paletteProbeLutWhite=7;g_paletteLookup.res->value=7;
+ std::vector<RGBA_t> colors(256*33);colors[7].s={255,254,253,255};colors[32*256+7].s={253,255,254,255};
+ RememberPaletteProbeLightTable(*g_currentLightTable,colors.data());assert(g_currentLightTable->probeWhiteValid&&g_currentLightTable->probeWhiteColumn==7);
+ g_currentLightTable->res->bytes.resize(colors.size()*4);std::memcpy(g_currentLightTable->res->bytes.data(),colors.data(),colors.size()*4);
+ g_screenPaletteColors[7].s={254,253,255,255};g_screenPalette.res->bytes.resize(256*4);std::memcpy(g_screenPalette.res->bytes.data(),g_screenPaletteColors,256*4);
+ texture.paletteProbeExpected.rgba=0xffffffff;texture.res->value=255;
+ MaybePaletteProbe(LAYOUT_POLY,false);assert(copies[1].box.left==7&&copies[2].box.left==7&&copies[3].box.left==7);
+ assert(logs.back().find("screen[7] CPU=fefdffff GPU=fefdffff screenMatch=1")!=std::string::npos);
+ assert(logs.back().find("uploadColumn=7 tableCPU=available row0 CPU=fffefdff GPU=fffefdff row32 CPU=fdfffeff GPU=fdfffeff tableMatch=1")!=std::string::npos);
+ // A changed LUT column cannot compare GPU column 8 against old CPU column 7.
+ g_paletteProbeLutWhite=8;g_paletteProbePending=true;MaybePaletteProbe(LAYOUT_POLY,false);
+ assert(logs.back().find("column=8 uploadColumn=7 tableCPU=unavailable")!=std::string::npos&&logs.back().find("tableMatch=-1")!=std::string::npos);
+ g_paletteProbeLutValid=false;RememberPaletteProbeLightTable(*g_currentLightTable,colors.data());assert(!g_currentLightTable->probeWhiteValid);
+ // Actual bytes, including mixed 253/254/255, survive selection and exact logging.
+ Reset();UINT8 pixels[32]{};
+ for(UINT8 channel:{253,254,255}){std::memset(pixels,0,32);pixels[12]=channel;pixels[13]=254;pixels[14]=255;pixels[15]=255;RememberPaletteProbeWhite(texture,pixels);assert(texture.paletteProbeWhite&&texture.paletteProbeX==3&&texture.paletteProbeY==0);assert(!std::memcmp(&texture.paletteProbeExpected,pixels+12,4));}
+ for(int channel=0;channel<4;channel++){std::memset(pixels,255,32);for(int i=0;i<8;i++)pixels[4*i+channel]=channel==3?254:252;RememberPaletteProbeWhite(texture,pixels);assert(!texture.paletteProbeWhite);}
+ std::memset(pixels,0,32);pixels[24]=253;pixels[25]=254;pixels[26]=255;pixels[27]=255;RememberPaletteProbeWhite(texture,pixels);assert(texture.paletteProbeX==2&&texture.paletteProbeY==1);
+ texture.res->width=4;texture.res->height=2;texture.res->bytes.assign(pixels,pixels+32);MaybePaletteProbe(LAYOUT_POLY,false);
+ assert(logs.back().find("CPU=fdfeffff GPU=fdfeffff textureMatch=1")!=std::string::npos);
+ texture.res->bytes[24]=252;g_paletteProbePending=true;MaybePaletteProbe(LAYOUT_POLY,false);
+ assert(logs.back().find("CPU=fdfeffff GPU=fcfeffff textureMatch=0")!=std::string::npos);
+ std::memset(pixels,0,32);RememberPaletteProbeWhite(texture,pixels);assert(!texture.paletteProbeWhite);
+ RGBA_t c{};c.s={0x12,0x34,0x56,0x78};assert(ProbeRGBA(c)==0x12345678);
+}

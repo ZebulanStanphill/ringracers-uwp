@@ -122,6 +122,13 @@ def generate(engine, output):
     }, output / "fog_capture.cpp")
     captures = Source(engine / "src/hardware/r_d3d12/d3d12_captures.inc")
     driver12 = Source(engine / "src/hardware/r_d3d12/r_d3d12.cpp")
+    probe = Source(engine / "src/hardware/r_d3d12/d3d12_paletteprobe.inc")
+    palette12 = Source(engine / "src/hardware/r_d3d12/d3d12_palette.inc")
+    render(templates / "paletteprobe_d3d12.cpp.in", {
+        "PROBE": probe.section("constexpr UINT kPaletteProbeSamples", "\nvoid MaybePaletteProbe") + probe.function("MaybePaletteProbe"),
+        "REMEMBER": driver12.function("RememberPaletteProbeWhite")
+            + palette12.function("RememberPaletteProbeLightTable"),
+    }, output / "paletteprobe_d3d12.cpp")
     for kind, param, srv in (("Fog", 16, 11), ("Water", 18, 12)):
         name = "Capture" + kind + "Scene"
         # Compare the exact production initializer bytes, including padding,

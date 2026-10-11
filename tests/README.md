@@ -205,6 +205,7 @@ To run one group, use e.g. `ctest --test-dir build/regression -R '^online_' -V`.
   is checked against a scalar oracle for odd sizes and 1×N textures. The 3D texture
 repack used for the palette lookup table is checked for row pitch, slice order and
 untouched padding.
+- **Direct3D 12 palette probe (diagnostic only):** with D3D12 and Palette Rendering on, run `d3d12_paletteprobe` during a scene to request one texture/palette-path snapshot; inspect the consolidated `paletteprobe` log. Upload metadata retains the first opaque RGB ≥253 texel's actual RGBA and coordinate. Every successful texture upload performs that base-mip scan, stopping at the first match or scanning the whole texture if none, even while the command is inactive; only the GPU readback is opt-in, and the Xbox cost of the scan is unmeasured. The GPU readback covers that texel, the R8 Texture3D LUT corner `(63,63,63)`, the screen palette at the CPU LUT corner index, and active light-table rows 0/32 at that column. The two CPU table colors and column are retained after successful upload; their expectation is marked unavailable if the current LUT index differs. Exact match fields report mismatches without changing rendering. The request expires at the next frame end or after 4,096 considered draws and can pause for a bounded 500 ms fence wait. `paletteprobe_d3d12` executes extracted production helpers with mocks for resource states, command order, padded footprints, nonzero white columns, near-white selection, inactive requests and failures. The WARP harness invokes the public command before synthetic sprite/floor draws, checks CPU/GPU log values and unchanged pixel oracles, duplicate/repeated requests, unarmed and off/skipped paths, and rejects a corrupted GPU expectation with `--negative-control palette-probe`. GBV validates copy states and restored bindings when run. Windows WARP execution, current-driver validation and the Xbox reproduction remain unrun here; no root cause or fix is claimed.
 - **Extraction safeguards:** ensure comments, strings, nested blocks and prototypes
   do not truncate extracted functions; reject missing/ambiguous definitions.
 
@@ -274,6 +275,52 @@ removal run under GPU-based validation, and the `palette:` perf line's counters 
 checked; the fade map scenes below are what read the master palette. Fog remapping with
 palette rendering is covered below; water with palette rendering and Xbox colors remain
 untested here.
+White regressions use synthetic `GL_TEXFMT_AP_88` sprites and `GL_TEXFMT_P_8`
+floors through production conversion, `SHADER_SPRITE`/`SHADER_FLOOR` (`PSSoftware`),
+LUT uploads and palette postprocessing. Both contain index 0 white, gray, blue and
+black controls; the sprite adds an alpha-zero white hole over a known background.
+Conversion, master and screen palettes agree. A synthetic nearest-color 64³ LUT
+uses the engine's four-byte grid spacing and includes corner `(63,63,63)` at white
+index 0. Expected RGB samples are literal fixture colors, independent of LUT
+construction and shader row calculations. These white fixtures require exact
+bytes, so the usual tolerance of one cannot hide a 254/255 boundary error.
+
+`white-sprite` and `white-floor` check row 0 full white. Their lower-light scenes
+(`white-dark-row`, `white-floor-dim`) require source white to become 254 gray in
+row 31, with darker gray/blue controls; the final pass maps 254 back to white.
+`white-brightmap` requires white/blue to use row 32 while the gray mask sample
+stays on row 31. `white-brightmap-reset` then draws the same base without its mask,
+using ordinary texture bindings with no forced unbind. Other rows hold a sentinel.
+`white-boundary` draws RGBA inputs 255, 254, 252 and 251 gray plus asymmetric whites
+with one 251 channel. Default/uncolormapped draws preserve those exact input bytes
+before the final pass; lit and dim floor draws require literal 255 and 254 outputs,
+respectively. All seven samples become white after the final pass.
+
+`white-restart` runs 48 cycles in the existing loop: retire/recreate AP88, P8 and
+light-table data, drawing old and new versions in one frame with reordered texels
+and changed gray/blue lighting. Both versions are retired before readback; white
+must survive. Cache clears must zero texture names and placed block/SRV reuse must
+increase. Tiny rings may submit internally, so a shared command list is not
+required. `white-toggle` checks both formats Off, with postprocess readback untouched,
+then On for three frames; explicit gray/blue changes prove surface lighting switches.
+Palette perf assertions include 99 additional light-table creations.
+
+The runner requires a negative control for each scene. `white-lut-corner` changes
+the actual uploaded LUT corner from index 0 to black index 3. The independent
+`white-lighttable-column` fault changes only column 0 in light-table rows 0 and 32
+to black, leaving the LUT and palettes intact. It first requires direct textured,
+default/uncolormapped HUD white to survive before and after the final pass, plus
+unchanged lower-light white and gray/blue/black floor controls. Then unchanged
+surface-white oracles must reject the faulty table. Other negatives perturb the
+expected pixel using the existing harness convention.
+
+Locally, the C++ was only syntax-checked with MinGW against patched engine headers.
+Windows WARP/debug/GBV, SM5.1 compilation and pixel/negative execution have not been
+run; use `./tests/run-d3d12.ps1` on Windows for them. No actual
+palette snapshot is available. These synthetic scenes do not run `RESTART MAP`,
+normal/Encore map logic or Xbox hardware, and do not reproduce or establish a fix
+for the intermittent report. Native Windows and Xbox/map reproduction remain needed.
+
 Fog and water scenes run the production capture path with the same tiny rings, so command-list
 submissions exercise rebinding and constant lifetimes. Fog draws over known scenery, including
 palette remapping through a light table. Water checks ordinary surface sampling and captured-scene

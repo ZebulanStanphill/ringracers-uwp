@@ -95,17 +95,17 @@ static auto line = function<void (*)(F2DCoord *,F2DCoord *,RGBA_t)>("Draw2DLine"
 static ID3D12InfoQueue *validationQueue=nullptr;
 static void validate(ID3D12InfoQueue *queue);
 using RGB=std::array<int,3>;
-static constexpr int W=64,H=64;
+static constexpr int W=64,H=64,whiteRestartFrames=48;
 static void reset(RGB c={48,80,112}) { FRGBAFloat f={c[0]/255.f,c[1]/255.f,c[2]/255.f,1}; clear(true,true,&f); }
 static FSurfaceInfo surface(RGB c,int alpha=255) { FSurfaceInfo s={}; s.PolyColor.s.red=(UINT8)c[0]; s.PolyColor.s.green=(UINT8)c[1]; s.PolyColor.s.blue=(UINT8)c[2]; s.PolyColor.s.alpha=(UINT8)alpha; return s; }
 static std::vector<FOutVector> quad(float z=1) { return {{-.8f*z,-.8f*z,z,0,0},{.8f*z,-.8f*z,z,0,0},{.8f*z,.8f*z,z,0,0},{-.8f*z,.8f*z,z,0,0}}; }
 static void draw(RGB c,FBITFIELD flags=0,float z=1,int alpha=255) { auto v=quad(z); auto s=surface(c,alpha); flags |= PF_Modulated|PF_NoTexture; blend(flags); polygon(&s,v.data(),(FUINT)v.size(),flags); }
-static std::vector<UINT8> pixels() { std::vector<UINT8> p(W*H*3,0xcd); readrect(0,0,W,H,W*3,reinterpret_cast<UINT16 *>(p.data())); return p; }
+static std::vector<UINT8> pixels(bool post=false) { std::vector<UINT8> p(W*H*3,0xcd); if(post) D3D12_ReadPaletteRectForTest(0,0,W,H,W*3,reinterpret_cast<UINT16 *>(p.data())); else readrect(0,0,W,H,W*3,reinterpret_cast<UINT16 *>(p.data())); return p; }
 static void expect(const char *scene,RGB want,int x=32,int y=32) { auto p=pixels(); validate(validationQueue); if(negative==scene) want[0]=(want[0]+67)%256; for(int c=0;c<3;c++) if(abs(p[(y*W+x)*3+c]-want[c])>1) { fprintf(stderr,"%s: pixel %d,%d channel %d got %d expected %d\n",scene,x,y,c,p[(y*W+x)*3+c],want[c]); negativeRejected = negative==scene; throw std::runtime_error("pixel oracle failed"); } }
 // Palette rendering's last step, read like expect reads the screen. scene names its own negative control.
-static void expectPost(const char *scene,RGB want,int x=32,int y=32) { std::vector<UINT8> p(W*H*3,0xcd); D3D12_ReadPaletteRectForTest(0,0,W,H,W*3,reinterpret_cast<UINT16 *>(p.data())); validate(validationQueue); if(negative==scene) want[0]=(want[0]+67)%256; for(int c=0;c<3;c++) if(abs(p[(y*W+x)*3+c]-want[c])>1) { fprintf(stderr,"%s: palette pixel %d,%d channel %d got %d expected %d\n",scene,x,y,c,p[(y*W+x)*3+c],want[c]); negativeRejected = negative==scene; throw std::runtime_error("palette pixel oracle failed"); } }
+static void expectPost(const char *scene,RGB want,int x=32,int y=32) { auto p=pixels(true); validate(validationQueue); if(negative==scene) want[0]=(want[0]+67)%256; for(int c=0;c<3;c++) if(abs(p[(y*W+x)*3+c]-want[c])>1) { fprintf(stderr,"%s: palette pixel %d,%d channel %d got %d expected %d\n",scene,x,y,c,p[(y*W+x)*3+c],want[c]); negativeRejected = negative==scene; throw std::runtime_error("palette pixel oracle failed"); } }
 // Compares a pixel of an already read image; scene names its own negative control.
-static void check(const char *scene,const std::vector<UINT8> &p,int x,int y,RGB want,int width=W) { if(negative==scene) want[0]=(want[0]+67)%256; for(int c=0;c<3;c++) if(abs(p[(y*width+x)*3+c]-want[c])>1) { fprintf(stderr,"%s: pixel %d,%d channel %d got %d expected %d (got %d,%d,%d expected %d,%d,%d)\n",scene,x,y,c,p[(y*width+x)*3+c],want[c],p[(y*width+x)*3],p[(y*width+x)*3+1],p[(y*width+x)*3+2],want[0],want[1],want[2]); negativeRejected = negative==scene; throw std::runtime_error("pixel oracle failed"); } }
+static void check(const char *scene,const std::vector<UINT8> &p,int x,int y,RGB want,int width=W,bool perturbExpected=true,int tolerance=1) { if(perturbExpected && negative==scene) want[0]=(want[0]+67)%256; for(int c=0;c<3;c++) if(abs(p[(y*width+x)*3+c]-want[c])>tolerance) { fprintf(stderr,"%s: pixel %d,%d channel %d got %d expected %d (got %d,%d,%d expected %d,%d,%d)\n",scene,x,y,c,p[(y*width+x)*3+c],want[c],p[(y*width+x)*3],p[(y*width+x)*3+1],p[(y*width+x)*3+2],want[0],want[1],want[2]); negativeRejected = negative==scene; throw std::runtime_error("pixel oracle failed"); } }
 static void fillRect(float x0,float x1,float y0,float y1,RGB c) { std::vector<FOutVector> v={{x0,y0,1,0,0},{x1,y0,1,0,0},{x1,y1,1,0,0},{x0,y1,1,0,0}}; auto s=surface(c); const FBITFIELD f=PF_Modulated|PF_NoTexture|PF_NoDepthTest; blend(f); polygon(&s,v.data(),4,f); }
 static void quadrants(RGB tl,RGB tr,RGB bl,RGB br) { reset({0,0,0}); fillRect(-1,0,0,1,tl); fillRect(0,1,0,1,tr); fillRect(-1,0,-1,0,bl); fillRect(0,1,-1,0,br); }
 // The screen's color at (x, y from the top) at the current size
@@ -362,6 +362,268 @@ int main(int argc,char **argv) {
             D3D12_FinishUpdate(0);
             pMasterPalette=nullptr; setLookup(lut.data()); // without a master palette, it goes
             clearLightTables(); deleteTexture(&paletteTexture);
+            function<void (*)()>("UnSetShader")(); special(HWD_SET_SHADERS,HWD_SHADEROPTION_OFF);
+            validate(validationQueue);
+        }
+        // White index 0 in AP88 sprites and P8 floors: LUT boundary, lighting and restart lifetimes.
+        {
+            auto setPalette=function<void (*)(RGBA_t *)>("SetPalette");
+            auto setLookup=function<void (*)(UINT8 *)>("SetPaletteLookup");
+            auto setScreenPalette=function<void (*)(RGBA_t *)>("SetScreenPalette");
+            auto createLightTable=function<UINT32 (*)(RGBA_t *)>("CreateLightTable");
+            auto clearLightTables=function<void (*)()>("ClearLightTables");
+            auto clearMipMapCache=function<void (*)()>("ClearMipMapCache");
+            auto setShader=function<void (*)(int)>("SetShader");
+            const RGB white={255,255,255}, gray={128,128,128}, blue={32,64,224}, black={0,0,0};
+            const RGB nearWhite={254,254,254};
+            const RGB background={48,80,112}, darkGray={64,64,64}, darkBlue={16,32,112};
+            const std::array<RGB,8> colors={white,gray,blue,black,background,darkGray,darkBlue,RGB{252,12,244}};
+            auto rgba=[](RGB c) { RGBA_t v={}; v.s.red=(UINT8)c[0]; v.s.green=(UINT8)c[1]; v.s.blue=(UINT8)c[2]; v.s.alpha=255; return v; };
+            std::array<RGBA_t,256> palette;
+            palette.fill(rgba(colors[7]));
+            for(size_t i=0;i<colors.size();i++) palette[i]=rgba(colors[i]);
+            // Test data, not a copy of PaletteIndex: nearest RGB colors throughout the cube,
+            // including a white region that reaches (63,63,63). Pixel oracles below are literal colors.
+            constexpr int n=HWR_PALETTE_LUT_SIZE;
+            std::vector<UINT8> lut(n*n*n);
+            for(int b=0;b<n;b++) for(int g=0;g<n;g++) for(int r=0;r<n;r++) {
+                double best=1e30; UINT8 index=0;
+                for(size_t i=0;i<colors.size();i++) {
+                    double dr=r*(256/n)-colors[i][0], dg=g*(256/n)-colors[i][1], db=b*(256/n)-colors[i][2];
+                    double distance=dr*dr+dg*dg+db*db;
+                    if(distance<best) { best=distance; index=(UINT8)i; }
+                }
+                lut[(b*n+g)*n+r]=index;
+            }
+            if(lut.back()!=0) throw std::runtime_error("white fixture LUT corner must be index 0");
+            // Required input fault: actual white becomes black. Keep the pixel oracle unchanged.
+            if(negative=="white-lut-corner") lut.back()=3;
+            pMasterPalette=palette.data(); setPalette(palette.data()); setLookup(lut.data()); setScreenPalette(palette.data());
+            special(HWD_SET_SHADERS,HWD_SHADEROPTION_ON); special(HWD_SET_PALETTE_RENDERING,1);
+            setShader(SHADER_SPRITE);
+            std::vector<RGBA_t> table(256*33,rgba(colors[7]));
+            for(int row:{0,32}) for(size_t i=0;i<colors.size();i++) table[row*256+i]=palette[i];
+            // Dark base row, with row32 retaining the base palette's fullbright colors.
+            table[31*256]=rgba(nearWhite); table[31*256+1]=rgba(darkGray);
+            table[31*256+2]=rgba(darkBlue); table[31*256+3]=rgba(black);
+            UINT32 lightId=createLightTable(table.data());
+            if(!lightId) throw std::runtime_error("white fixture light table failed");
+            std::array<UINT8,10> ap88={0,255, 1,255, 2,255, 3,255, 0,0};
+            GLMipmap_t sprite={}; sprite.format=GL_TEXFMT_AP_88; sprite.flags=TF_TRANSPARENT;
+            sprite.width=5; sprite.height=1; sprite.data=ap88.data();
+            std::array<UINT8,20> mask={255,255,255,255, 128,128,128,255, 255,255,255,255, 0,0,0,255, 255,255,255,255};
+            GLMipmap_t bright={}; bright.format=GL_TEXFMT_RGBA; bright.flags=TF_BRIGHTMAP;
+            bright.width=5; bright.height=1; bright.data=mask.data();
+            std::array<UINT8,4> p8={0,1,2,3};
+            GLMipmap_t floor={}; floor.format=GL_TEXFMT_P_8;
+            floor.width=4; floor.height=1; floor.data=p8.data();
+            auto surfaceDraw=[&](GLMipmap_t &tex,int shader,UINT32 id,float left,float right,int light,float z,bool brightmap,float bottom,float top) {
+                // Use the engine's normal base-then-brightmap binding sequence; no forced unbind.
+                texture(&tex); if(brightmap) texture(&bright);
+                setShader(shader);
+                auto q=quad(z); q[0].x=q[3].x=left*z; q[1].x=q[2].x=right*z;
+                q[0].y=q[1].y=bottom*z; q[2].y=q[3].y=top*z;
+                q[0].s=q[3].s=0; q[1].s=q[2].s=1;
+                auto s=surface(white); s.LightTableId=id; s.LightInfo.light_level=light; s.LightInfo.fade_end=31;
+                const FBITFIELD flags=PF_Modulated|PF_ColorMapped|PF_Masked|PF_NoDepthTest;
+                blend(flags); polygon(&s,q.data(),4,flags);
+            };
+            auto spriteDraw=[&](UINT32 id,float left=-.8f,float right=.8f,int light=255,float z=1,bool brightmap=false,float bottom=-.8f,float top=.8f) {
+                surfaceDraw(sprite,SHADER_SPRITE,id,left,right,light,z,brightmap,bottom,top);
+            };
+            auto floorDraw=[&](UINT32 id,float left=-.8f,float right=.8f,int light=255,float z=1,float bottom=-.8f,float top=.8f) {
+                surfaceDraw(floor,SHADER_FLOOR,id,left,right,light,z,false,bottom,top);
+            };
+            const std::array<RGB,5> full={white,gray,blue,black,background};
+            const std::array<RGB,5> dim={nearWhite,darkGray,darkBlue,black,background};
+            const std::array<RGB,5> dimPost={white,darkGray,darkBlue,black,background};
+            const std::array<RGB,5> brightWant={white,darkGray,blue,black,background};
+            const std::array<int,5> fullX={12,22,32,42,52}, leftX={6,11,16,21,26}, rightX={38,43,48,53,58};
+            const std::array<int,4> floorX={13,26,38,51}, floorLeftX={6,13,19,26}, floorRightX={38,45,51,58};
+            const std::array<RGB,4> floorFull={white,gray,blue,black}, floorDim={nearWhite,darkGray,darkBlue,black};
+            const std::array<RGB,4> floorDimPost={white,darkGray,darkBlue,black};
+            auto verifyImage=[&](const char *scene,const std::vector<UINT8> &image,const auto &xs,const auto &want,int y=32) {
+                // Exact bytes distinguish the observed 254 white from 255; no tolerance of one here.
+                for(size_t i=0;i<xs.size();i++) check(scene,image,xs[i],y,want[i],W,true,0);
+            };
+            auto verify=[&](const char *scene,const char *postScene,const auto &xs,const auto &want,const auto &postWant) {
+                auto before=pixels(); validate(validationQueue);
+                verifyImage(scene,before,xs,want);
+                auto after=pixels(true); validate(validationQueue);
+                verifyImage(postScene,after,xs,postWant);
+            };
+            // Arm through the public console handler before any geometry-ring allocations.
+            // The real R8 Texture3D corner and four RGBA8 one-texel copies run under GBV.
+            auto probeLog=[&](size_t start,bool captured,const char *skip=nullptr) {
+                const std::string tail=logs.substr(start);
+                const std::string prefix=captured?"paletteprobe diagnostic-only: ":"paletteprobe diagnostic-only skipped: ";
+                auto at=tail.find(prefix);
+                if(at==std::string::npos || tail.find("paletteprobe",at+prefix.size())!=std::string::npos)
+                    throw std::runtime_error("palette probe did not produce exactly one consolidated result");
+                auto end=tail.find('\n',at);
+                const auto result=tail.substr(at,end-at);
+                if(skip) {
+                    if(result.find(skip)==std::string::npos) throw std::runtime_error("palette probe wrong skip reason");
+                    return;
+                }
+                const std::array<const char *,8> expected={"diagnostic-only: ok;", "CPU=ffffffff GPU=ffffffff textureMatch=1",
+                    "LUT(63,63,63) CPU=0 GPU=0 lutMatch=1", "screen[0] CPU=ffffffff GPU=ffffffff screenMatch=1",
+                    "column=0 uploadColumn=0 tableCPU=available", "row0 CPU=ffffffff GPU=ffffffff",
+                    "row32 CPU=ffffffff GPU=ffffffff", "tableMatch=1"};
+                for(const char *token:expected) {
+                    // Required negative control: independently corrupt the expected GPU texture bytes.
+                    const char *want=negative=="palette-probe" && token==expected[1]
+                        ?"CPU=ffffffff GPU=fefefeff textureMatch=1":token;
+                    if(result.find(want)==std::string::npos) {
+                        negativeRejected=negative=="palette-probe";
+                        throw std::runtime_error("palette probe CPU/GPU expectation rejected");
+                    }
+                }
+                validate(validationQueue);
+            };
+            reset(background);
+            size_t probeStart=logs.size();
+            if(negative!="white-lut-corner") { D3D12_PaletteProbe_f(); D3D12_PaletteProbe_f(); }
+            spriteDraw(lightId);
+            if(negative!="white-lut-corner") probeLog(probeStart,true);
+            // A second ordinary draw while unarmed must not capture again.
+            probeStart=logs.size(); spriteDraw(lightId);
+            if(logs.substr(probeStart).find("paletteprobe")!=std::string::npos) throw std::runtime_error("unarmed palette probe captured");
+            // Separate unchanged white oracle for the corrupted-LUT negative control.
+            { auto image=pixels(); validate(validationQueue); check("white-lut-corner",image,fullX[0],32,white,W,false,0); }
+            verify("white-sprite","white-sprite-post",fullX,full,full); D3D12_FinishUpdate(0);
+            reset(background); spriteDraw(lightId,-.8f,.8f,0,128.125f);
+            verify("white-dark-row","white-dark-row-post",fullX,dim,dimPost); D3D12_FinishUpdate(0);
+            reset(background); spriteDraw(lightId,-.8f,.8f,0,128.125f,true);
+            verify("white-brightmap","white-brightmap-post",fullX,brightWant,brightWant); D3D12_FinishUpdate(0);
+            // The same main texture immediately follows its brightmap: stale unit1 would keep white/blue fullbright.
+            reset(background); spriteDraw(lightId,-.8f,.8f,0,128.125f);
+            verify("white-brightmap-reset","white-brightmap-reset-post",fullX,dim,dimPost); D3D12_FinishUpdate(0);
+            reset(background); probeStart=logs.size(); D3D12_PaletteProbe_f(); floorDraw(lightId);
+            probeLog(probeStart,true);
+            verify("white-floor","white-floor-post",floorX,floorFull,floorFull); D3D12_FinishUpdate(0);
+            reset(background); floorDraw(lightId,-.8f,.8f,0,128.125f);
+            verify("white-floor-dim","white-floor-dim-post",floorX,floorDim,floorDimPost); D3D12_FinishUpdate(0);
+
+            // Boundary input bytes enter the real LUT both from surfaces and from the final screen pass.
+            // The asymmetric samples cross a cube boundary in each axis independently.
+            const std::array<RGB,7> boundary={white,nearWhite,RGB{252,252,252},RGB{251,251,251},RGB{251,255,255},RGB{255,251,255},RGB{255,255,251}};
+            const std::array<RGB,7> boundaryFull={white,white,white,white,white,white,white};
+            const std::array<RGB,7> boundaryDim={nearWhite,nearWhite,nearWhite,nearWhite,nearWhite,nearWhite,nearWhite};
+            const std::array<int,7> boundaryX={10,17,25,32,39,47,54};
+            std::array<RGBA_t,7> boundaryData;
+            for(size_t i=0;i<boundary.size();i++) boundaryData[i]=rgba(boundary[i]);
+            GLMipmap_t boundaryTexture={}; boundaryTexture.format=GL_TEXFMT_RGBA;
+            boundaryTexture.width=7; boundaryTexture.height=1; boundaryTexture.data=boundaryData.data();
+            reset(background); texture(&boundaryTexture); setShader(SHADER_DEFAULT); textured();
+            verify("white-boundary","white-boundary-post",boundaryX,boundary,boundaryFull); D3D12_FinishUpdate(0);
+            reset(background); surfaceDraw(boundaryTexture,SHADER_FLOOR,lightId,-.8f,.8f,255,1,false,-.8f,.8f);
+            verify("white-boundary-lit","white-boundary-lit-post",boundaryX,boundaryFull,boundaryFull); D3D12_FinishUpdate(0);
+            reset(background); surfaceDraw(boundaryTexture,SHADER_FLOOR,lightId,-.8f,.8f,0,128.125f,false,-.8f,.8f);
+            verify("white-boundary-dim","white-boundary-dim-post",boundaryX,boundaryDim,boundaryFull); D3D12_FinishUpdate(0);
+
+            // Input fault, not an expected-value fault: corrupt only the fullbright light-table white column.
+            // The master/screen palettes and LUT remain intact, and the lower-light white stays 254.
+            auto faultTable=table;
+            if(negative=="white-lighttable-column") faultTable[0]=faultTable[32*256]=rgba(black);
+            UINT32 faultId=createLightTable(faultTable.data());
+            if(!faultId) throw std::runtime_error("white column light table failed");
+            reset(background); floorDraw(faultId,-.9f,-.1f);
+            spriteDraw(faultId,.1f,.9f,0,128.125f,true);
+            floorDraw(faultId,-.9f,-.1f,0,128.125f,-.8f,-.1f);
+            // PSDefault samples a real white texel; PF_NoTexture would sample the driver's black fallback.
+            texture(&boundaryTexture); setShader(SHADER_DEFAULT);
+            auto hud=quad(); hud[0].y=hud[1].y=.65f; hud[2].y=hud[3].y=.9f;
+            auto hudSurface=surface(white);
+            polygon(&hudSurface,hud.data(),4,PF_Modulated|PF_NoDepthTest);
+            auto beforeFault=pixels(); validate(validationQueue);
+            auto afterFault=pixels(true); validate(validationQueue);
+            check("white-hud",beforeFault,32,8,white,W,true,0);
+            check("white-hud-post",afterFault,32,8,white,W,true,0);
+            check("white-floor-dim",beforeFault,floorLeftX[0],48,nearWhite,W,false,0);
+            check("white-floor-dim-post",afterFault,floorLeftX[0],48,white,W,false,0);
+            for(size_t i=1;i<floorFull.size();i++) {
+                check("white-floor",beforeFault,floorLeftX[i],32,floorFull[i],W,false,0);
+                check("white-floor-post",afterFault,floorLeftX[i],32,floorFull[i],W,false,0);
+            }
+            // Check the unchanged HUD first so the actual fault must be isolated to surface lighting.
+            check("white-lighttable-column",beforeFault,floorLeftX[0],32,white,W,false,0);
+            check("white-lighttable-column",beforeFault,rightX[0],32,white,W,false,0);
+            check("white-lighttable-column",afterFault,floorLeftX[0],32,white,W,false,0);
+            check("white-lighttable-column",afterFault,rightX[0],32,white,W,false,0);
+            D3D12_FinishUpdate(0);
+            UINT64 placedBefore=0,blocksBefore=0,srvsBefore=0;
+            D3D12_GetReuseCountsForTest(&placedBefore,&blocksBefore,&srvsBefore);
+            for(int frame=0;frame<whiteRestartFrames;frame++) {
+                // Reset old data, then draw before retiring both the texture and light table.
+                clearMipMapCache(); clearLightTables();
+                if(sprite.downloaded || bright.downloaded || floor.downloaded) throw std::runtime_error("white surface cache clear kept texture names");
+                ap88={0,255, 1,255, 2,255, 3,255, 0,0};
+                p8={0,1,2,3};
+                table[1]=rgba(gray); table[2]=rgba(blue);
+                lightId=createLightTable(table.data());
+                if(!lightId) throw std::runtime_error("old restart light table failed");
+                reset(background); spriteDraw(lightId,-.9f,-.1f,255,1,false,.1f,.9f);
+                floorDraw(lightId,-.9f,-.1f,255,1,-.9f,-.1f);
+                // No readback/present between old/new draws. White stays white; gray/blue and
+                // texel order change so stale texture/table bindings cannot satisfy both oracles.
+                clearMipMapCache(); clearLightTables();
+                if(sprite.downloaded || bright.downloaded || floor.downloaded) throw std::runtime_error("white surface cache clear kept texture names");
+                ap88={2,255, 1,255, 0,255, 3,255, 0,0};
+                p8={2,1,0,3};
+                table[1]=rgba(darkGray); table[2]=rgba(darkBlue);
+                lightId=createLightTable(table.data());
+                if(!lightId) throw std::runtime_error("new restart light table failed");
+                spriteDraw(lightId,.1f,.9f,255,1,false,.1f,.9f);
+                floorDraw(lightId,.1f,.9f,255,1,-.9f,-.1f);
+                // Retire the new resources too while their draws are still pending.
+                clearMipMapCache(); clearLightTables();
+                if(sprite.downloaded || bright.downloaded || floor.downloaded) throw std::runtime_error("white restart retirement kept texture names");
+                const std::array<RGB,5> spriteNew={darkBlue,darkGray,white,black,background};
+                const std::array<RGB,4> floorNew={darkBlue,darkGray,white,black};
+                for(bool post:{false,true}) {
+                    auto image=pixels(post); validate(validationQueue);
+                    const char *scene=post?"white-restart-post":"white-restart";
+                    verifyImage(scene,image,leftX,full,16);
+                    verifyImage(scene,image,rightX,spriteNew,16);
+                    verifyImage(scene,image,floorLeftX,floorFull,48);
+                    verifyImage(scene,image,floorRightX,floorNew,48);
+                }
+                D3D12_FinishUpdate(0);
+            }
+            UINT64 placedAfter=0,blocksAfter=0,srvsAfter=0;
+            D3D12_GetReuseCountsForTest(&placedAfter,&blocksAfter,&srvsAfter);
+            if(blocksAfter<=blocksBefore || srvsAfter<=srvsBefore) throw std::runtime_error("white restart block/SRV reuse not exercised");
+            // Off/On is the reported workaround: draw the same AP88/P8 textures on both sides of it.
+            ap88={0,255, 1,255, 2,255, 3,255, 0,0}; table[1]=rgba(darkGray); table[2]=rgba(darkBlue);
+            p8={0,1,2,3};
+            const std::array<RGB,5> toggleOn={white,darkGray,darkBlue,black,background};
+            const std::array<RGB,4> floorToggleOn={white,darkGray,darkBlue,black};
+            lightId=createLightTable(table.data());
+            if(!lightId) throw std::runtime_error("toggle light table failed");
+            for(int enabled:{0,1,1,1}) {
+                special(HWD_SET_PALETTE_RENDERING,enabled);
+                probeStart=logs.size(); if(!enabled) D3D12_PaletteProbe_f();
+                reset(background); spriteDraw(lightId,-.8f,.8f,255,1,false,.1f,.9f);
+                floorDraw(lightId,-.8f,.8f,255,1,-.9f,-.1f);
+                auto image=pixels(); validate(validationQueue);
+                const auto &want=enabled?toggleOn:full;
+                verifyImage("white-toggle",image,fullX,want,16);
+                const auto &floorWant=enabled?floorToggleOn:floorFull;
+                verifyImage("white-toggle",image,floorX,floorWant,48);
+                if(enabled) {
+                    auto after=pixels(true); validate(validationQueue);
+                    verifyImage("white-toggle-post",after,fullX,toggleOn,16);
+                    verifyImage("white-toggle-post",after,floorX,floorToggleOn,48);
+                }
+                else { auto untouched=pixels(true); for(auto c:untouched) if(c!=0xcd) throw std::runtime_error("white toggle off ran postprocess"); }
+                D3D12_FinishUpdate(0);
+                if(!enabled) probeLog(probeStart,false,"Palette Rendering is off");
+            }
+            probeStart=logs.size(); D3D12_PaletteProbe_f(); D3D12_FinishUpdate(0);
+            probeLog(probeStart,false,"no ordinary colormapped draw");
+            clearLightTables(); deleteTexture(&sprite); deleteTexture(&bright); deleteTexture(&floor); deleteTexture(&boundaryTexture);
+            special(HWD_SET_PALETTE_RENDERING,0); pMasterPalette=nullptr; setLookup(lut.data());
             function<void (*)()>("UnSetShader")(); special(HWD_SET_SHADERS,HWD_SHADEROPTION_OFF);
             validate(validationQueue);
         }
@@ -779,7 +1041,8 @@ int main(int argc,char **argv) {
         { unsigned alive=9,uploads=0; int created=0,updated=0; double passes=0,ms=0; auto pp=logs.find("UWP perf:   D3D12: palette: rendering ");
           if(pp==std::string::npos) throw std::runtime_error("missing palette perf line");
           if(sscanf(logs.c_str()+pp,"UWP perf:   D3D12: palette: rendering %*s %u light tables alive, %d created, %d updated; %u LUT/palette uploads; %lf post passes per frame, %lf ms per frame",&alive,&created,&updated,&uploads,&passes,&ms)!=6
-             || alive!=0 || created!=98 || updated!=3 || uploads<6 || passes<=0) throw std::runtime_error("palette perf counters are wrong"); }
+             // Existing palette scenes create 98 tables; white scenes add initial/fault/toggle plus two per restart.
+             || alive!=0 || created!=98+3+2*whiteRestartFrames || updated!=3 || uploads<6 || passes<=0) throw std::runtime_error("palette perf counters are wrong"); }
         { int full=0,twoPass=0,images=0,fades=0,fallbacks=0; auto sp=logs.find("UWP perf:   D3D12: screens: ");
           if(sp==std::string::npos) throw std::runtime_error("missing screens perf line");
           if(sscanf(logs.c_str()+sp,"UWP perf:   D3D12: screens: %*f per frame (%*f copies, %*f barriers); wipes %d full, %d two-pass; post image %d; fade maps %d drawn, %d left to the overlay",&full,&twoPass,&images,&fades,&fallbacks)!=5
@@ -796,6 +1059,6 @@ int main(int argc,char **argv) {
             throw std::runtime_error("shutdown device lifetime oracle failed");
         }
         if(!negative.empty()) throw std::runtime_error("unknown or unexercised negative control");
-        puts("Production D3D12 WARP driver scenes passed (RGB tolerance 1, GBV clean)"); return 0;
+        puts("Production D3D12 WARP driver scenes passed (RGB tolerance 1; white fixtures exact, GBV clean)"); return 0;
     } catch(const std::exception &e) { fprintf(stderr,"FAIL: %s\n",e.what()); D3D12_Shutdown(); if(negativeRejected) fprintf(stderr,"NEGATIVE_ORACLE_REJECTED: %s\n",negative.c_str()); return 1; }
 }
