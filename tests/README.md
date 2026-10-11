@@ -259,7 +259,10 @@ reset only touches the aperture, allowing farther child geometry while preservin
 outside occlusion. `portal-plane` checks world-plane clipping and disabling the plane.
 Each has its own required negative control. These pixel scenes use production driver
 entry points under debug/GBV; recursive map visuals, transformed camera/model clipping,
-and fog/water portal interactions still require further testing.
+and fog/water portal interactions still require further testing. The user confirmed
+on Xbox that portals and water effects work on the Direct3D 12 backend; that covers
+basic visuals only. Advanced interactions, palette water, split views and performance
+remain untested.
 Palette scenes turn Palette Rendering on with a known 64³ lookup table (index 7 only
 where red is low and green and blue are high, otherwise 19), a light table and a screen
 palette. A colormapped textured polygon must read the light table's color from the screen

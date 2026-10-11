@@ -1,4 +1,4 @@
-From 2bb92d29875ee03d5bea872be5565801644d25ba Mon Sep 17 00:00:00 2001
+From 4d3f67e33ebe93cb20b4a06a23836031b1f8961e Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -586,6 +586,15 @@ Model: claude-opus-5-5
 Agent: Codex (Sol, palette diagnostic and regression)
 Model: gpt-6.1-sol
 Agent: Claude Code (Haiku, context recovery, documentation and review)
+Model: claude-haiku-5-5
+
+- [UWP]: Record the user's Xbox confirmation that Direct3D 12 portals
+  and water effects work. Fog and advanced interactions remain unverified.
+  This updates validation documentation only; the engine source is unchanged.
+
+Agent: Codex (Sol, device validation documentation)
+Model: gpt-6.1-sol
+Agent: Claude Code (Haiku, device validation documentation)
 Model: claude-haiku-5-5
 ---
  CMakeLists.txt                              |   19 +-
