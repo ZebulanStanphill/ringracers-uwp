@@ -1,4 +1,4 @@
-From 3b799b92c6e41502ce41e245a6aca5d2483c938e Mon Sep 17 00:00:00 2001
+From b342eab7fa6ae323d549ae78de9daaf13603e375 Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -537,6 +537,16 @@ preserves the preceding polygon flags and may unbind PF_NoTexture again.
 
 Agent: Codex (Sol, D3D12 S6)
 Model: gpt-6.1-sol
+
+- [UWP]: Check format-specific tiled footprint before requesting 4 KB texture
+  alignment. The 8192x1 R32_SINT water sine table needs 64 KB alignment despite
+  its 32 KB raw byte count; WARP GBV caught the invalid small-alignment probe.
+
+Agent: Codex (Sol, D3D12 S6 captures)
+Model: gpt-6.1-sol
+
+Agent: Codex (Sol, D3D12 S6)
+Model: gpt-6.1-sol
 ---
  CMakeLists.txt                            |   19 +-
  CMakePresets.json                         |   17 +
@@ -591,7 +601,7 @@ Model: gpt-6.1-sol
  src/hardware/r_d3d12/d3d12_upload.h       |   54 +
  src/hardware/r_d3d12/mips.h               |   60 +
  src/hardware/r_d3d12/pipeline_key.h       |   51 +
- src/hardware/r_d3d12/r_d3d12.cpp          | 2837 +++++++++
+ src/hardware/r_d3d12/r_d3d12.cpp          | 2844 +++++++++
  src/hardware/r_d3d12/r_d3d12.h            |   58 +
  src/hardware/r_d3d12/texture_repack.h     |   36 +
  src/hardware/r_opengl/r_opengl.c          |  308 +-
@@ -647,7 +657,7 @@ Model: gpt-6.1-sol
  src/w_wad.cpp                             |  312 +
  src/w_wad.h                               |   11 +
  src/z_zone.cpp                            |    5 +
- 109 files changed, 23193 insertions(+), 1127 deletions(-)
+ 109 files changed, 23200 insertions(+), 1127 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -20051,10 +20061,10 @@ index 0000000..736f77d
 +#endif
 diff --git a/src/hardware/r_d3d12/r_d3d12.cpp b/src/hardware/r_d3d12/r_d3d12.cpp
 new file mode 100644
-index 0000000..dbfd85e
+index 0000000..3db5f2c
 --- /dev/null
 +++ b/src/hardware/r_d3d12/r_d3d12.cpp
-@@ -0,0 +1,2837 @@
+@@ -0,0 +1,2844 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// Copyright (C) 2025 by Kart Krew.
@@ -20939,11 +20949,18 @@ index 0000000..dbfd85e
 +bool CreateTextureResource(GpuTexture &texture, D3D12_RESOURCE_DESC desc)
 +{
 +	CollectTextureBlocks();
-+	// 4 KB alignment is only valid if the most detailed mip is at most 64 KB; asking otherwise is a validation error
-+	const UINT64 topBytes = (UINT64)desc.Width * desc.Height * (desc.Format == DXGI_FORMAT_R8_UNORM ? 1 : 4);
++	// Small alignment requires the top mip's tiled footprint to fit in 64 KB.
++	// Thin textures can exceed sixteen 4 KB tiles even when their raw bytes fit.
++	const UINT tileSize = desc.Format == DXGI_FORMAT_R8_UNORM ? 64
++		: (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R32_SINT) ? 32 : 0;
++	const bool smallEligible = tileSize && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
++		&& desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1
++		&& desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN
++		&& !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
++		&& ((desc.Width + tileSize - 1) / tileSize) * (((UINT64)desc.Height + tileSize - 1) / tileSize) <= 16;
 +	D3D12_RESOURCE_ALLOCATION_INFO info = {};
 +	bool smallPlacement = false;
-+	if (topBytes <= 64 * 1024)
++	if (smallEligible)
 +	{
 +		desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
 +		info = Core_Device()->GetResourceAllocationInfo(0, 1, &desc);

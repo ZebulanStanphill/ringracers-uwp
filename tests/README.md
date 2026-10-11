@@ -236,7 +236,9 @@ rectangle uses none. `capture-mixed` requires fog and water in the same command 
 recorded draws and after a resize; `capture-skipped` skips two-vertex fans after capture
 and checks the next capture/draw, including pending opposite-transition merging. Each has
 a negative control. Xbox visual results, render-target decompression cost and performance
-remain untested.
+remain untested. Water sine creation also checks small-resource alignment under GBV:
+the 8192×1 R32_SINT table exceeds sixteen 4 KB tiles despite its 32 KB raw size,
+so it uses normal 64 KB placement alignment.
 Screen scenes draw a screen of four colored quadrants, copy it, clear the screen and
 draw the copy back. `screen-copy` does so with the intermission background, which must
 reproduce every quadrant; `final-screen` draws the final screen into a viewport twice
