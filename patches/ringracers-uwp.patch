@@ -1,4 +1,4 @@
-From e6761a6bc4ff8fdcf9def43abe8fabb9ee476e40 Mon Sep 17 00:00:00 2001
+From 3b799b92c6e41502ce41e245a6aca5d2483c938e Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -528,6 +528,12 @@ Model: claude-opus-5-5
 S6 regression scenes restore the palette texture after fog's PF_NoTexture
 unbind before continuing the palette lifetime checks. Capture tests also cover
 mixed command lists, skipped draws, and texture recreation after flush/resize.
+
+Agent: Codex (Sol, D3D12 S6)
+Model: gpt-6.1-sol
+
+S6 textured regression draws rebind their fixtures after clears: ClearBuffer
+preserves the preceding polygon flags and may unbind PF_NoTexture again.
 
 Agent: Codex (Sol, D3D12 S6)
 Model: gpt-6.1-sol

@@ -245,6 +245,7 @@ int main(int argc,char **argv) {
             GLMipmap_t paletteTexture={}; paletteTexture.format=GL_TEXFMT_RGBA; paletteTexture.width=paletteTexture.height=1; paletteTexture.data=paletteTexel.data();
             texture(&paletteTexture);
             auto paletteDraw=[&](UINT32 id,float left=-.8f,float right=.8f) {
+                texture(&paletteTexture);
                 auto q=quad(); q[0].x=q[3].x=left; q[1].x=q[2].x=right;
                 auto white=surface({255,255,255}); white.LightTableId=id; white.LightInfo.light_level=255;
                 const FBITFIELD flags=PF_Modulated|PF_ColorMapped|PF_NoDepthTest;
@@ -349,7 +350,7 @@ int main(int argc,char **argv) {
             auto ws=surface({255,255,255}); ws.LightInfo.light_level=255; ws.LightInfo.fade_end=31;
             const float z=128.125f; auto q=quad(z); q[0].t=q[1].t=0; q[2].t=q[3].t=1;
             for(int tick:{0,6,41,128}) {
-                shaderInfo(HWD_SHADERINFO_LEVELTIME,tick); reset();
+                shaderInfo(HWD_SHADERINFO_LEVELTIME,tick); reset(); texture(&water);
                 polygon(&ws,q.data(),4,PF_Modulated|PF_ColorMapped|PF_Ripple|PF_NoDepthTest);
                 auto image=pixels(); validate(validationQueue);
                 for(int y:{20,32,44}) {
