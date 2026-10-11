@@ -1,4 +1,4 @@
-From bbb4043c11b7186d9ce30305a7e84566243cbdd5 Mon Sep 17 00:00:00 2001
+From db07c413bcdd92787052ae6afe05bfdac035d52a Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -627,6 +627,16 @@ Model: claude-haiku-5-5
 
 Agent: Claude Code (Opus, light table diagnosis)
 Model: claude-opus-5-5
+
+- [UWP]: Turn DRED back on; turning it off didn't stop the light-table
+  corruption. Leave 4 KB of slack after every texture placed in a shared heap.
+  The light-table check's history showed the corrupted table directly after a
+  256x256 RGBA texture that exactly filled its 256 KB block, created 30
+  frames earlier, so a placed texture on Xbox can write past the size
+  GetResourceAllocationInfo reports.
+
+Agent: Claude Code (Opus, light table diagnosis)
+Model: claude-opus-5-5
 ---
  CMakeLists.txt                              |   19 +-
  CMakePresets.json                           |   17 +
@@ -665,7 +675,7 @@ Model: claude-opus-5-5
  src/hardware/r_d3d12/allocators.h           |  196 +
  src/hardware/r_d3d12/d3d12_arenas.inc       |   94 +
  src/hardware/r_d3d12/d3d12_captures.inc     |  272 +
- src/hardware/r_d3d12/d3d12_core.cpp         |  853 +++
+ src/hardware/r_d3d12/d3d12_core.cpp         |  845 +++
  src/hardware/r_d3d12/d3d12_core.h           |  140 +
  src/hardware/r_d3d12/d3d12_interop.cpp      |  558 ++
  src/hardware/r_d3d12/d3d12_interop.h        |   49 +
@@ -683,7 +693,7 @@ Model: claude-opus-5-5
  src/hardware/r_d3d12/d3d12_upload.h         |   54 +
  src/hardware/r_d3d12/mips.h                 |   60 +
  src/hardware/r_d3d12/pipeline_key.h         |   51 +
- src/hardware/r_d3d12/r_d3d12.cpp            | 3107 +++++++++
+ src/hardware/r_d3d12/r_d3d12.cpp            | 3112 +++++++++
  src/hardware/r_d3d12/r_d3d12.h              |   68 +
  src/hardware/r_d3d12/texture_repack.h       |   36 +
  src/hardware/r_opengl/r_opengl.c            |  308 +-
@@ -741,7 +751,7 @@ Model: claude-opus-5-5
  src/w_wad.cpp                               |  312 +
  src/w_wad.h                                 |   11 +
  src/z_zone.cpp                              |    5 +
- 113 files changed, 24198 insertions(+), 1137 deletions(-)
+ 113 files changed, 24195 insertions(+), 1137 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -15184,10 +15194,10 @@ index 0000000..dfa1f46
 +}
 diff --git a/src/hardware/r_d3d12/d3d12_core.cpp b/src/hardware/r_d3d12/d3d12_core.cpp
 new file mode 100644
-index 0000000..3324ad9
+index 0000000..ff690d3
 --- /dev/null
 +++ b/src/hardware/r_d3d12/d3d12_core.cpp
-@@ -0,0 +1,853 @@
+@@ -0,0 +1,845 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// This program is free software distributed under the
@@ -15337,14 +15347,6 @@ index 0000000..3324ad9
 +void EnableDred()
 +{
 +	// Must happen before the device is made. Optional: on Xbox it may not exist.
-+	// [UWP]: Off for now. On Xbox a light table's first 32-bit word turned to zero mid-race with nothing in the
-+	// driver writing to it, which fits DRED's breadcrumb counters landing in reused memory.
-+	constexpr bool kDred = false;
-+	if (!kDred)
-+	{
-+		g_dredResult = E_NOTIMPL;
-+		return;
-+	}
 +	ComPtr<ID3D12DeviceRemovedExtendedDataSettings> settings;
 +	g_dredResult = D3D12GetDebugInterface(IID_PPV_ARGS(&settings));
 +	g_dred = SUCCEEDED(g_dredResult) && settings;
@@ -20977,10 +20979,10 @@ index 0000000..736f77d
 +#endif
 diff --git a/src/hardware/r_d3d12/r_d3d12.cpp b/src/hardware/r_d3d12/r_d3d12.cpp
 new file mode 100644
-index 0000000..f31d228
+index 0000000..227dbc3
 --- /dev/null
 +++ b/src/hardware/r_d3d12/r_d3d12.cpp
-@@ -0,0 +1,3107 @@
+@@ -0,0 +1,3112 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// Copyright (C) 2025 by Kart Krew.
@@ -21946,9 +21948,14 @@ index 0000000..f31d228
 +		smallPlacement = info.Alignment == D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT && info.SizeInBytes != UINT64_MAX;
 +	}
 +	if (!smallPlacement) { desc.Alignment = 0; info = Core_Device()->GetResourceAllocationInfo(0, 1, &desc); }
-+	if (info.SizeInBytes <= 4 * 1024 * 1024)
++	// [UWP]: On Xbox a placed texture can write a few bytes past the size GetResourceAllocationInfo reports: a
++	// 256x256 RGBA texture that exactly filled its 256 KB block zeroed the first texel of the light table after it.
++	// Leave slack after every placed texture so the next block is never touched.
++	constexpr UINT64 kPlacementSlack = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
++	const size_t blockBytes = (size_t)(info.SizeInBytes + kPlacementSlack);
++	if (blockBytes <= 4 * 1024 * 1024)
 +	{
-+		auto block = g_textureArena.Allocate((size_t)info.SizeInBytes);
++		auto block = g_textureArena.Allocate(blockBytes);
 +		if (block.needsChunk)
 +		{
 +			D3D12_HEAP_DESC heapDesc = {}; heapDesc.SizeInBytes = kTextureHeapBytes;
@@ -21962,7 +21969,7 @@ index 0000000..f31d228
 +				g_textureArena.AddChunk();
 +				g_textureHeaps.push_back(heap);
 +				Log("texture heap #%u (16 MB)", (unsigned)g_textureHeaps.size());
-+				block = g_textureArena.Allocate((size_t)info.SizeInBytes);
++				block = g_textureArena.Allocate(blockBytes);
 +			}
 +		}
 +		if (block.valid)
