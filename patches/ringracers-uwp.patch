@@ -1,4 +1,4 @@
-From a5f12d9d59e5bfb83108a7b1f0ea3970b40857ab Mon Sep 17 00:00:00 2001
+From dcf137d3edd8ea63ab823078db9751978436fcf1 Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -698,7 +698,7 @@ Model: gpt-6.1-sol
 Agent: Codex (/root/isolation_export, commit preparation)
 Model: gpt-6-luna
 
-- [UWP]: Make the standalone isolation app's default run a one-pass characterisation of the Xbox placed-texture state-word defect: a self-contained, commented minimal repro on its own device (a 64 KB buffer adjacent to a placed 256x256 texture in a CUSTOM and a DEFAULT heap, checked after creation and fenced transitions), a byte-level map suite that classifies every DWORD the driver changes before, inside and after each placed resource through an aliased CPU window over 29 texture/buffer cases and every GPU step, committed and placed CPU-visible texture tests with a default-heap upload-source check, and a four-variant copy-ordering test. The 408-case matrix stays behind a legacy option. Add a CPU injection self-test for the map suite. Engine renderer source is unchanged.
+- [UWP]: Make the standalone isolation app's default run a one-pass characterisation of the Xbox placed-texture state-word defect: a self-contained, commented minimal repro on its own device (a 64 KB buffer adjacent to a placed 256x256 texture in a CUSTOM and a DEFAULT heap, checked after creation and fenced transitions), a byte-level map suite that classifies every DWORD the driver changes before, inside and after each placed resource through an aliased CPU window over 29 texture/buffer cases and every GPU step, committed and placed CPU-visible texture tests with a default-heap upload-source check, and a four-variant copy-ordering test. The 408-case matrix stays behind a legacy option. Add a CPU injection self-test for the map suite. Add five first-use probes, each on a brand-new device, that test what makes the first CUSTOM heap use fail (first use after device creation, after an empty submit, after a default heap, as a committed buffer, and with hand-built node masks); log a flushed CALL breadcrumb before every D3D12/DXGI call and in the stage setup paths; add a watchdog that logs WATCHDOG lines when nothing is logged for 5 seconds; run every stage behind an SEH guard that logs the exception code, address, module and offset, leaks that stage's objects and continues on a new device (with an unhandled-exception filter for other threads and a console-only SEH self-test); and leave the DRED settings untouched on the default path. Engine renderer source is unchanged.
 
 Agent: Claude Code (Opus 5.5)
 Model: claude-opus-5-5
@@ -761,9 +761,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/hardware/r_d3d12/d3d12_screens.inc        |  580 ++
  src/hardware/r_d3d12/d3d12_upload.cpp         |  112 +
  src/hardware/r_d3d12/d3d12_upload.h           |   54 +
- src/hardware/r_d3d12/isolation/isolation.cpp  |  807 +++
- src/hardware/r_d3d12/isolation/isolation.h    |   32 +
- .../r_d3d12/isolation/minimal_repro.cpp       |  624 ++
+ src/hardware/r_d3d12/isolation/isolation.cpp  | 1046 +++
+ src/hardware/r_d3d12/isolation/isolation.h    |   47 +
+ .../r_d3d12/isolation/minimal_repro.cpp       | 1070 +++
  src/hardware/r_d3d12/isolation/observe.hlsl   |   18 +
  src/hardware/r_d3d12/mips.h                   |   60 +
  src/hardware/r_d3d12/pipeline_key.h           |   51 +
@@ -825,7 +825,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/w_wad.cpp                                 |  312 +
  src/w_wad.h                                   |   11 +
  src/z_zone.cpp                                |    5 +
- 119 files changed, 26353 insertions(+), 1137 deletions(-)
+ 119 files changed, 27053 insertions(+), 1137 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -21551,10 +21551,10 @@ index 0000000..4171b1c
 +#endif
 diff --git a/src/hardware/r_d3d12/isolation/isolation.cpp b/src/hardware/r_d3d12/isolation/isolation.cpp
 new file mode 100644
-index 0000000..62cd69e
+index 0000000..e3edf24
 --- /dev/null
 +++ b/src/hardware/r_d3d12/isolation/isolation.cpp
-@@ -0,0 +1,807 @@
+@@ -0,0 +1,1046 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// Windows SDK and C++ standard library only. Each invocation owns a fresh device.
 +#include "isolation.h"
@@ -21568,11 +21568,17 @@ index 0000000..62cd69e
 +#include <wrl/client.h>
 +#include <algorithm>
 +#include <climits>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
 +#include <cstdarg>
++#include <cstdint>
 +#include <cstdio>
 +#include <cstring>
 +#include <memory>
++#include <mutex>
 +#include <string>
++#include <thread>
 +#include <vector>
 +#include "isolation_shaders/ObserveBytes.h"
 +#include "isolation_shaders/ObserveUInt.h"
@@ -21623,6 +21629,8 @@ index 0000000..62cd69e
 + ComPtr<ID3D12PipelineState> bytesPSO,uintPSO;
 + HANDLE event=nullptr; U64 serial=0; bool recording=false,fatal=false,compute=false;
 + bool coherent=false,tier2=false,logFences=true; UINT descriptorSize=0;
++ // CALL breadcrumbs (default suite only): stage is "B", "C" or "D"; gpuPhase names the MapRun step being recorded.
++ const char* stage=""; const char* gpuPhase=""; bool crumbs=false;
 + // Retain every GPU object until the device is idle. On fatal timeout, Run leaks
 + // this entire context deliberately; objects referenced by pending work survive.
 + std::vector<ComPtr<IUnknown>> retained;
@@ -21630,6 +21638,12 @@ index 0000000..62cd69e
 + ~Context() { if(event) CloseHandle(event); }
 + void log(const char*fmt,...) { char text[4096]; va_list ap; va_start(ap,fmt);
 + vsnprintf(text,sizeof(text),fmt,ap); va_end(ap); if(sink) sink(user,text); }
++ // Logged immediately before the named call so the last CALL line names a crash or hang.
++ void crumb(const char*api,const char*fmt=nullptr,...) { if(!crumbs)return; char detail[640]="";
++ if(fmt) { va_list ap; va_start(ap,fmt); vsnprintf(detail,sizeof(detail),fmt,ap); va_end(ap); }
++ log("CALL stage=%s api=%s%s%s",stage,api,fmt?" ":"",detail); }
++ void crumbHeap(const char*what,const D3D12_HEAP_DESC&h) {
++ crumb("CreateHeap","what=%s size=%llu type=%u cpuPage=%u pool=%u creationNode=%u visibleNode=%u alignment=%llu flags=0x%x",what,(U64)h.SizeInBytes,(UINT)h.Properties.Type,(UINT)h.Properties.CPUPageProperty,(UINT)h.Properties.MemoryPoolPreference,(UINT)h.Properties.CreationNodeMask,(UINT)h.Properties.VisibleNodeMask,(U64)h.Alignment,(UINT)h.Flags); }
 + bool checked(HRESULT hr,const char*api,bool deviceFailure=true) {
 + if(SUCCEEDED(hr)) return true;
 + log("API_FAILURE api=%s hr=0x%08lx",api,(unsigned long)hr);
@@ -21639,9 +21653,11 @@ index 0000000..62cd69e
 + }
 + template<class T> void keep(const ComPtr<T>& p) { if(p) { ComPtr<IUnknown> x; p.As(&x); retained.push_back(x); } }
 + bool begin() { if(fatal) return false;
++ crumb("CommandAllocator.Reset+CommandList.Reset","phase=%s",gpuPhase);
 + if(!checked(allocator->Reset(),"Allocator.Reset") || !checked(list->Reset(allocator.Get(),nullptr),"List.Reset"))return false;
 + recording=true; return true; }
 + bool submit(const char*phase) { if(fatal)return false;
++ crumb("CommandList.Close+ExecuteCommandLists+Queue.Signal+Fence.Wait","phase=%s fence=%llu",phase,serial+1); gpuPhase="";
 + if(!checked(list->Close(),"List.Close"))return false; recording=false;
 + ID3D12CommandList* lists[]={list.Get()}; queue->ExecuteCommandLists(1,lists);
 + ++serial; if(!checked(queue->Signal(fence.Get(),serial),"Queue.Signal"))return false;
@@ -21672,6 +21688,7 @@ index 0000000..62cd69e
 + void activate(ID3D12Resource*r) { D3D12_RESOURCE_BARRIER x={};x.Type=D3D12_RESOURCE_BARRIER_TYPE_ALIASING;x.Aliasing.pResourceAfter=r;list->ResourceBarrier(1,&x); }
 + ComPtr<ID3D12Resource> makeBuffer(U64 size,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state,D3D12_RESOURCE_FLAGS flags=D3D12_RESOURCE_FLAG_NONE) {
 + ComPtr<ID3D12Resource> r; auto p=props(type); auto d=buffer(size,flags);
++ crumb("CreateCommittedResource","what=buffer heapType=%u bytes=%llu state=0x%x flags=0x%x",(UINT)type,size,(UINT)state,(UINT)flags);
 + if(checked(device->CreateCommittedResource(&p,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&r)),"CreateCommittedResource(buffer)")){keep(r);auto a=device->GetResourceAllocationInfo(0,1,&d);log("BUFFER type=%u descWidth=%llu allocationSize=%llu allocationAlignment=%llu initialState=%s flags=%u",(UINT)type,size,a.SizeInBytes,a.Alignment,stateName(state),(UINT)flags);}return r;
 + }
 + bool fill(ID3D12Resource*r,const std::vector<unsigned char>& data) {
@@ -21681,7 +21698,7 @@ index 0000000..62cd69e
 + D3D12_RANGE wrote={0,data.size()};r->Unmap(0,&wrote);return true;
 + }
 + bool read(ID3D12Resource*r,U64 size,std::vector<unsigned char>& data) {
-+ void*p=nullptr;D3D12_RANGE range={0,(SIZE_T)size};if(!checked(r->Map(0,&range,&p),"Readback.Map"))return false;
++ void*p=nullptr;D3D12_RANGE range={0,(SIZE_T)size};crumb("Resource.Map","what=readback bytes=%llu",size);if(!checked(r->Map(0,&range,&p),"Readback.Map"))return false;
 + data.assign((unsigned char*)p,(unsigned char*)p+size);D3D12_RANGE noWrite={0,0};r->Unmap(0,&noWrite);return true;
 + }
 + bool initialize();
@@ -21689,60 +21706,73 @@ index 0000000..62cd69e
 +bool Context::initialize() {
 + log("RRDIAG BEGIN warp=%u debug=%u gbv=%u dred=%u quick=%u repeats=%u injection=%u",options.warp,options.debug,options.gpuValidation,options.dredEnabled,options.quick,options.repeats,(UINT)options.injection);
 + bool appliedDebug=false,appliedGBV=false,appliedDred=false;
++ // The default suite leaves DRED alone (like the failing Xbox run) unless the console asked for it.
++ const bool touchDred=options.legacySuite||options.dredExplicit;
 + if(options.debug||options.gpuValidation) {
 + ComPtr<ID3D12Debug> debug;
++ crumb("D3D12GetDebugInterface","interface=ID3D12Debug");
 + if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
 + debug->EnableDebugLayer();appliedDebug=true;
 + if(options.gpuValidation) { ComPtr<ID3D12Debug1> d1;if(SUCCEEDED(debug.As(&d1))) {d1->SetEnableGPUBasedValidation(TRUE);appliedGBV=true;} }
 + }
 + }
 +#if defined(__ID3D12DeviceRemovedExtendedDataSettings_INTERFACE_DEFINED__)
++ if(touchDred) {
 + ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
++ crumb("D3D12GetDebugInterface","interface=ID3D12DeviceRemovedExtendedDataSettings");
 + if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
 + auto setting=options.dredEnabled?D3D12_DRED_ENABLEMENT_FORCED_ON:D3D12_DRED_ENABLEMENT_FORCED_OFF;
 + dred->SetAutoBreadcrumbsEnablement(setting);dred->SetPageFaultEnablement(setting);appliedDred=true;
 + }
++ }
 +#endif
-+ log("SETTINGS debugRequested=%u debugApplied=%u gbvRequested=%u gbvApplied=%u dredRequested=%u dredApplied=%u configuredBeforeDevice=1",options.debug,appliedDebug,options.gpuValidation,appliedGBV,options.dredEnabled,appliedDred);
++ log("SETTINGS debugRequested=%u debugApplied=%u gbvRequested=%u gbvApplied=%u dredRequested=%u dredApplied=%u configuredBeforeDevice=1 dredUntouched=%u",options.debug,appliedDebug,options.gpuValidation,appliedGBV,touchDred&&options.dredEnabled,appliedDred,!touchDred);
++ crumb("CreateDXGIFactory2","flags=0x%x",appliedDebug?DXGI_CREATE_FACTORY_DEBUG:0);
 + HRESULT factoryHR=CreateDXGIFactory2(appliedDebug?DXGI_CREATE_FACTORY_DEBUG:0,IID_PPV_ARGS(&factory));
-+ if(FAILED(factoryHR)&&appliedDebug){log("UNAVAILABLE DXGI factory debug flag hr=0x%08lx retryWithoutFlag=1",(unsigned long)factoryHR);factoryHR=CreateDXGIFactory2(0,IID_PPV_ARGS(&factory));}
++ if(FAILED(factoryHR)&&appliedDebug){log("UNAVAILABLE DXGI factory debug flag hr=0x%08lx retryWithoutFlag=1",(unsigned long)factoryHR);crumb("CreateDXGIFactory2","flags=0x0");factoryHR=CreateDXGIFactory2(0,IID_PPV_ARGS(&factory));}
 + if(!checked(factoryHR,"CreateDXGIFactory2"))return false;
-+ if(options.warp) { if(!checked(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)),"EnumWarpAdapter"))return false; }
-+ else { for(UINT i=0;;++i) { ComPtr<IDXGIAdapter1> a;HRESULT hr=factory->EnumAdapters1(i,&a);
-+ if(hr==DXGI_ERROR_NOT_FOUND)break;if(FAILED(hr))continue;DXGI_ADAPTER_DESC1 d={};a->GetDesc1(&d);
++ if(options.warp) { crumb("EnumWarpAdapter");if(!checked(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)),"EnumWarpAdapter"))return false; }
++ else { for(UINT i=0;;++i) { ComPtr<IDXGIAdapter1> a;crumb("EnumAdapters1","index=%u",i);HRESULT hr=factory->EnumAdapters1(i,&a);
++ if(hr==DXGI_ERROR_NOT_FOUND)break;if(FAILED(hr))continue;DXGI_ADAPTER_DESC1 d={};crumb("IDXGIAdapter1.GetDesc1","index=%u",i);a->GetDesc1(&d);
 + if(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)continue;
++ crumb("D3D12CreateDevice","adapterIndex=%u device=null",i);
 + if(SUCCEEDED(D3D12CreateDevice(a.Get(),D3D_FEATURE_LEVEL_11_0,__uuidof(ID3D12Device),nullptr))) {adapter=a;break;} }
 + if(!adapter) {log("UNAVAILABLE no hardware D3D12 adapter; explicit WARP option required");++result.unavailableCases;return false;}
 + }
-+ DXGI_ADAPTER_DESC1 ad={};adapter->GetDesc1(&ad);char desc[256]={};WideCharToMultiByte(CP_UTF8,0,ad.Description,-1,desc,sizeof(desc),nullptr,nullptr);
++ DXGI_ADAPTER_DESC1 ad={};crumb("IDXGIAdapter1.GetDesc1");adapter->GetDesc1(&ad);char desc[256]={};WideCharToMultiByte(CP_UTF8,0,ad.Description,-1,desc,sizeof(desc),nullptr,nullptr);
 + log("ADAPTER description=%s luid=%08lx:%08lx vendor=%04x device=%04x subsystem=%08x revision=%u dedicatedVideo=%llu shared=%llu mode=%s",desc,(unsigned long)ad.AdapterLuid.HighPart,(unsigned long)ad.AdapterLuid.LowPart,ad.VendorId,ad.DeviceId,ad.SubSysId,ad.Revision,(U64)ad.DedicatedVideoMemory,(U64)ad.SharedSystemMemory,options.warp?"WARP":"hardware");
++ crumb("D3D12CreateDevice","featureLevel=0x%x",(UINT)D3D_FEATURE_LEVEL_11_0);
 + if(!checked(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"D3D12CreateDevice"))return false;
 + if(appliedDebug)device.As(&info);
-+ D3D12_FEATURE_DATA_ARCHITECTURE arch={};HRESULT ah=device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE,&arch,sizeof(arch));
-+ D3D12_FEATURE_DATA_D3D12_OPTIONS capabilities={};HRESULT oh=device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,&capabilities,sizeof(capabilities));
++ D3D12_FEATURE_DATA_ARCHITECTURE arch={};crumb("CheckFeatureSupport(ARCHITECTURE)");HRESULT ah=device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE,&arch,sizeof(arch));
++ D3D12_FEATURE_DATA_D3D12_OPTIONS capabilities={};crumb("CheckFeatureSupport(D3D12_OPTIONS)");HRESULT oh=device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,&capabilities,sizeof(capabilities));
 + coherent=SUCCEEDED(ah)&&arch.UMA&&arch.CacheCoherentUMA;tier2=SUCCEEDED(oh)&&capabilities.ResourceHeapTier==D3D12_RESOURCE_HEAP_TIER_2;
 + D3D_FEATURE_LEVEL levels[]={D3D_FEATURE_LEVEL_12_1,D3D_FEATURE_LEVEL_12_0,D3D_FEATURE_LEVEL_11_1,D3D_FEATURE_LEVEL_11_0};
-+ D3D12_FEATURE_DATA_FEATURE_LEVELS fl={4,levels,D3D_FEATURE_LEVEL_11_0};device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS,&fl,sizeof(fl));
++ D3D12_FEATURE_DATA_FEATURE_LEVELS fl={4,levels,D3D_FEATURE_LEVEL_11_0};crumb("CheckFeatureSupport(FEATURE_LEVELS)");device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS,&fl,sizeof(fl));
 + log("CAPABILITIES featureLevel=0x%x architectureHr=0x%08lx UMA=%u cacheCoherentUMA=%u heapTier=%u bindingTier=%u optionsHr=0x%08lx",fl.MaxSupportedFeatureLevel,(unsigned long)ah,arch.UMA,arch.CacheCoherentUMA,(UINT)capabilities.ResourceHeapTier,(UINT)capabilities.ResourceBindingTier,(unsigned long)oh);
 +#if defined(__ID3D12Device1_INTERFACE_DEFINED__)
-+ D3D12_FEATURE_DATA_SHADER_MODEL sm={D3D_SHADER_MODEL_5_1};HRESULT sh=device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,&sm,sizeof(sm));
++ D3D12_FEATURE_DATA_SHADER_MODEL sm={D3D_SHADER_MODEL_5_1};crumb("CheckFeatureSupport(SHADER_MODEL)");HRESULT sh=device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,&sm,sizeof(sm));
 + log("SHADER_MODEL hr=0x%08lx highest=0x%x shaderBytecode=cs_5_0",(unsigned long)sh,(UINT)sm.HighestShaderModel);
 +#else
 + log("SHADER_MODEL query=unavailable shaderBytecode=cs_5_0");
 +#endif
 + D3D12_COMMAND_QUEUE_DESC q={};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
-+ if(!checked(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue)),"CreateCommandQueue")||!checked(device->CreateCommandAllocator(q.Type,IID_PPV_ARGS(&allocator)),"CreateCommandAllocator")||!checked(device->CreateCommandList(0,q.Type,allocator.Get(),nullptr,IID_PPV_ARGS(&list)),"CreateCommandList")||!checked(list->Close(),"InitialList.Close")||!checked(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"CreateFence"))return false;
-+ event=CreateEventExW(nullptr,nullptr,0,EVENT_ALL_ACCESS);if(!event){checked(HRESULT_FROM_WIN32(GetLastError()),"CreateEvent");return false;}
++ crumb("CreateCommandQueue");if(!checked(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue)),"CreateCommandQueue"))return false;
++ crumb("CreateCommandAllocator");if(!checked(device->CreateCommandAllocator(q.Type,IID_PPV_ARGS(&allocator)),"CreateCommandAllocator"))return false;
++ crumb("CreateCommandList");if(!checked(device->CreateCommandList(0,q.Type,allocator.Get(),nullptr,IID_PPV_ARGS(&list)),"CreateCommandList"))return false;
++ crumb("CommandList.Close");if(!checked(list->Close(),"InitialList.Close"))return false;
++ crumb("CreateFence");if(!checked(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"CreateFence"))return false;
++ crumb("CreateEventExW");event=CreateEventExW(nullptr,nullptr,0,EVENT_ALL_ACCESS);if(!event){checked(HRESULT_FROM_WIN32(GetLastError()),"CreateEvent");return false;}
 + D3D12_DESCRIPTOR_RANGE ranges[2]={};ranges[0].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;ranges[1].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
 + for(auto&r:ranges){r.NumDescriptors=1;r.OffsetInDescriptorsFromTableStart=D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;}
 + D3D12_ROOT_PARAMETER parameters[3]={};parameters[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;parameters[0].Constants.Num32BitValues=4;
 + for(UINT i=0;i<2;++i){parameters[i+1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;parameters[i+1].DescriptorTable.NumDescriptorRanges=1;parameters[i+1].DescriptorTable.pDescriptorRanges=&ranges[i];}
 + D3D12_ROOT_SIGNATURE_DESC rd={};rd.NumParameters=3;rd.pParameters=parameters;
-+ ComPtr<ID3DBlob> blob,error;HRESULT rh=D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error);
-+ if(SUCCEEDED(rh))rh=device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root));
++ ComPtr<ID3DBlob> blob,error;crumb("D3D12SerializeRootSignature");HRESULT rh=D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error);
++ if(SUCCEEDED(rh)){crumb("CreateRootSignature");rh=device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root));}
 + if(SUCCEEDED(rh)) {D3D12_COMPUTE_PIPELINE_STATE_DESC p={};p.pRootSignature=root.Get();p.CS={g_ObserveBytes,sizeof(g_ObserveBytes)};
-+ rh=device->CreateComputePipelineState(&p,IID_PPV_ARGS(&bytesPSO));
-+ if(SUCCEEDED(rh)) {p.CS={g_ObserveUInt,sizeof(g_ObserveUInt)};rh=device->CreateComputePipelineState(&p,IID_PPV_ARGS(&uintPSO));}}
++ crumb("CreateComputePipelineState","shader=ObserveBytes");rh=device->CreateComputePipelineState(&p,IID_PPV_ARGS(&bytesPSO));
++ if(SUCCEEDED(rh)) {p.CS={g_ObserveUInt,sizeof(g_ObserveUInt)};crumb("CreateComputePipelineState","shader=ObserveUInt");rh=device->CreateComputePipelineState(&p,IID_PPV_ARGS(&uintPSO));}}
 + compute=SUCCEEDED(rh);descriptorSize=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 + log("COMPUTE available=%u hr=0x%08lx",compute,(unsigned long)rh);inspectDebug();return true;
 +}
@@ -22006,11 +22036,13 @@ index 0000000..62cd69e
 +}
 +ComPtr<ID3D12Resource> qbuf(Context&c,U64 size,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state) {
 + ComPtr<ID3D12Resource> r; auto p=props(type); auto d=buffer(size);
++ c.crumb("CreateCommittedResource","what=buffer heapType=%u bytes=%llu state=0x%x flags=0x0",(UINT)type,size,(UINT)state);
 + if(c.checked(c.device->CreateCommittedResource(&p,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&r)),"CreateCommittedResource(buffer)"))c.keep(r);
 + return r;
 +}
 +bool qfill(Context&c,ID3D12Resource*r,const std::vector<unsigned char>& data) {
 + void*p=nullptr; D3D12_RANGE none={0,0};
++ c.crumb("Resource.Map+Unmap","what=upload bytes=%llu",(U64)data.size());
 + if(!c.checked(r->Map(0,&none,&p),"Upload.Map"))return false;
 + memcpy(p,data.data(),data.size()); D3D12_RANGE wrote={0,data.size()}; r->Unmap(0,&wrote); return true;
 +}
@@ -22108,7 +22140,7 @@ index 0000000..62cd69e
 + std::swap(prev,cur);
 + }
 + template<class F> bool gpu(const char*phase,F body) {
-+ if(!c.begin())return false; body(); if(!c.submit(phase))return false;
++ c.gpuPhase=phase; if(!c.begin())return false; body(); if(!c.submit(phase))return false;
 + snapshot(); analyze(phase,!strcmp(phase,"upload")); return true; // the snapshot precedes all logging for the step
 + }
 + bool to(D3D12_RESOURCE_STATES next,const char*name) { return gpu(name,[&]{c.transition(tex.Get(),state,next);state=next;}); }
@@ -22118,20 +22150,23 @@ index 0000000..62cd69e
 + desc=mapDesc(m); O=m.offset; auto fi=formatInfo(m.format);
 + c.log("MAP_CASE id=%u name=%s dim=%s width=%llu height=%u depthOrArray=%u mips=%u format=%s flags=%u requestedAlignment=%llu offset=%llu",
 + id,m.name,dimName(m),(U64)desc.Width,m.control?1u:desc.Height,m.control?1u:m.depth,m.control?1u:m.mips,m.control?"BUFFER":fi.name,(UINT)m.flags,m.alignment,O);
++ c.crumb("GetResourceAllocationInfo","id=%u",id);
 + auto info=c.device->GetResourceAllocationInfo(0,1,&desc);
 + if(info.SizeInBytes==UINT64_MAX)return unavailable("GetResourceAllocationInfo");
 + S=info.SizeInBytes;
 + if(info.Alignment&&O%info.Alignment)return unavailable("offset-not-aligned");
-+ auto explicitDesc=desc; explicitDesc.Alignment=65536; auto explicitInfo=c.device->GetResourceAllocationInfo(0,1,&explicitDesc);
++ auto explicitDesc=desc; explicitDesc.Alignment=65536; c.crumb("GetResourceAllocationInfo","id=%u alignment=65536",id); auto explicitInfo=c.device->GetResourceAllocationInfo(0,1,&explicitDesc);
 + if(!m.control) {
 + UINT subs=m.dim==D3D12_RESOURCE_DIMENSION_TEXTURE3D?m.mips:m.mips*m.depth;
 + fps.resize(subs);rows.resize(subs);rowSizes.resize(subs);
++ c.crumb("GetCopyableFootprints","id=%u subresources=%u",id,subs);
 + c.device->GetCopyableFootprints(&desc,0,subs,0,fps.data(),rows.data(),rowSizes.data(),&total);
 + } else total=S;
 + char o0[32]="unavailable",o1[32]="unavailable",ot[32]="unavailable";
 +#if defined(__ID3D12Device4_INTERFACE_DEFINED__)
 + { ComPtr<ID3D12Device4> device4;
 + if(SUCCEEDED(c.device.As(&device4))) { D3D12_RESOURCE_DESC two[2]={desc,desc}; D3D12_RESOURCE_ALLOCATION_INFO1 one[2]={};
++ c.crumb("GetResourceAllocationInfo1","id=%u",id);
 + auto all=device4->GetResourceAllocationInfo1(0,2,two,one);
 + snprintf(o0,sizeof(o0),"%llu",one[0].Offset);snprintf(o1,sizeof(o1),"%llu",one[1].Offset);snprintf(ot,sizeof(ot),"%llu",all.SizeInBytes); } }
 +#endif
@@ -22141,23 +22176,28 @@ index 0000000..62cd69e
 + if(!upload||!qfill(c,upload.Get(),uploadData))return false;
 + bool renderTarget=(m.flags&D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)!=0,unordered=(m.flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)!=0;
 + if(renderTarget) { D3D12_DESCRIPTOR_HEAP_DESC hd={};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=1;
++ c.crumb("CreateDescriptorHeap","id=%u type=RTV count=1",id);
 + if(!c.checked(c.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvHeap)),"CreateDescriptorHeap(RTV)"))return false; c.keep(rtvHeap); }
++ c.crumb("GetCustomHeapProperties","id=%u",id);
 + auto custom=c.device->GetCustomHeapProperties(0,D3D12_HEAP_TYPE_UPLOAD);
 + if(!usableCustomHeap(c,custom))return unavailable("no-write-back-L0-custom-heap");
 + H=align(O+S+131072,65536); words=(size_t)(H/4);
 + D3D12_HEAP_DESC hd={}; hd.SizeInBytes=H; hd.Properties=custom; hd.Alignment=65536; hd.Flags=D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
++ c.crumbHeap("map-heap",hd);
 + HRESULT hr=c.device->CreateHeap(&hd,IID_PPV_ARGS(&heap)); if(FAILED(hr))return unavailable("CreateHeap",hr); c.keep(heap);
-+ auto wd=buffer(H); hr=c.device->CreatePlacedResource(heap.Get(),0,&wd,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&window));
++ auto wd=buffer(H); c.crumb("CreatePlacedResource","what=window id=%u heapOffset=0 bytes=%llu state=0x%x",id,H,(UINT)D3D12_RESOURCE_STATE_GENERIC_READ);
++ hr=c.device->CreatePlacedResource(heap.Get(),0,&wd,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&window));
 + if(FAILED(hr))return unavailable("CreatePlacedResource(window)",hr); c.keep(window);
 + if(!c.begin())return false; c.activate(window.Get()); if(!c.submit("map-window-activate"))return false;
-+ void*mapped=nullptr; hr=window->Map(0,nullptr,&mapped); if(FAILED(hr)||!mapped)return unavailable("Map(window)",hr);
++ void*mapped=nullptr; c.crumb("Resource.Map","what=window id=%u bytes=%llu",id,H); hr=window->Map(0,nullptr,&mapped); if(FAILED(hr)||!mapped)return unavailable("Map(window)",hr);
 + w=static_cast<volatile UINT*>(mapped); prev.assign(words,0); cur.assign(words,0);
 + for(size_t i=0;i<words;++i)w[i]=windowWord(i);
 + snapshot(); size_t wrong=0; for(size_t i=0;i<words;++i)if(cur[i]!=windowWord(i))++wrong;
 + if(wrong){++c.result.selfTestsFailed;c.log("SELF_TEST_FAIL name=map-window-readback id=%u wrongWords=%llu",id,(U64)wrong);}
 + std::swap(prev,cur);
 + c.log("MAP_WINDOW id=%u heapSize=%llu windowWords=%llu textureRange=[%llu,%llu) pattern=windowWord(i)",id,H,(U64)words,O,O+S);
-+ // Create, then snapshot immediately: nothing is logged or submitted in between.
++ // Create, then snapshot immediately: nothing is logged or submitted in between (the breadcrumb precedes the call).
++ c.crumb("CreatePlacedResource","what=texture id=%u heapOffset=%llu dimension=%s width=%llu height=%u depthOrArray=%u mips=%u format=%u flags=0x%x state=0x%x",id,O,dimName(m),(U64)desc.Width,(UINT)desc.Height,(UINT)desc.DepthOrArraySize,(UINT)desc.MipLevels,(UINT)desc.Format,(UINT)desc.Flags,(UINT)D3D12_RESOURCE_STATE_COMMON);
 + hr=c.device->CreatePlacedResource(heap.Get(),O,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&tex));
 + snapshot();
 + if(FAILED(hr)) { if(FAILED(c.device->GetDeviceRemovedReason()))c.checked(c.device->GetDeviceRemovedReason(),"CreatePlacedResource/device removed"); return unavailable("CreatePlacedResource(test)",hr); }
@@ -22173,7 +22213,7 @@ index 0000000..62cd69e
 + dst.pResource=tex.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;dst.SubresourceIndex=s;c.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);} }) &&
 + to(D3D12_RESOURCE_STATE_COPY_SOURCE,"to_COPY_SOURCE") && to(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,"to_PIXEL_SHADER_RESOURCE");
 + if(ok&&renderTarget)ok=to(D3D12_RESOURCE_STATE_RENDER_TARGET,"to_RENDER_TARGET") && gpu("clear_rtv",[&]{
-+ auto handle=rtvHeap->GetCPUDescriptorHandleForHeapStart(); c.device->CreateRenderTargetView(tex.Get(),nullptr,handle);
++ c.crumb("CreateRenderTargetView+ClearRenderTargetView","id=%u",id); auto handle=rtvHeap->GetCPUDescriptorHandleForHeapStart(); c.device->CreateRenderTargetView(tex.Get(),nullptr,handle);
 + const float color[4]={0.25f,0.5f,0.75f,1.0f}; c.list->ClearRenderTargetView(handle,color,0,nullptr); });
 + if(ok&&unordered)ok=to(D3D12_RESOURCE_STATE_UNORDERED_ACCESS,"to_UNORDERED_ACCESS");
 + if(ok)ok=to(D3D12_RESOURCE_STATE_COPY_DEST,"to_COPY_DEST_2") && to(D3D12_RESOURCE_STATE_COMMON,"to_COMMON");
@@ -22181,7 +22221,7 @@ index 0000000..62cd69e
 + size_t first=(size_t)(O/4),last=(size_t)((O+S+3)/4),differs=0;
 + for(size_t i=0;i<words;++i)if((i<first||i>=last)&&prev[i]!=windowWord(i))++differs;
 + c.log("MAP_CASE_END id=%u complete=%u outsideChangedVsOriginal=%llu stepsWithOutsideWrites=%u",id,ok,(U64)differs,outsideSteps);
-+ if(!c.fatal)window->Unmap(0,nullptr);
++ if(!c.fatal){c.crumb("Resource.Unmap","what=window id=%u",id);window->Unmap(0,nullptr);}
 + return true;
 +}
 +std::vector<MapCase> mapMatrix(bool quick) {
@@ -22226,22 +22266,25 @@ index 0000000..62cd69e
 + const char*label=placed?"placed":"committed";
 + auto unavailable=[&](const char*why,HRESULT hr){ c.log("COMMITTED_CPU_UNAVAILABLE placement=%s reason=%s hr=0x%08lx",label,why,(unsigned long)hr); ++c.result.unavailableCases; };
 + if(!cpuVisibleHeaps(c)) { unavailable("requires-cache-coherent-UMA-and-resource-heap-tier-2",S_OK); return; }
++ c.crumb("GetCustomHeapProperties","placement=%s",label);
 + auto custom=c.device->GetCustomHeapProperties(0,D3D12_HEAP_TYPE_UPLOAD);
 + if(!usableCustomHeap(c,custom)) { unavailable("no-write-back-L0-custom-heap",S_OK); return; }
 + auto desc=texture(256,256,DXGI_FORMAT_R8G8B8A8_UNORM,false); ComPtr<ID3D12Heap> heap; ComPtr<ID3D12Resource> r; HRESULT hr;
-+ if(placed) { auto info=c.device->GetResourceAllocationInfo(0,1,&desc); D3D12_HEAP_DESC hd={}; hd.SizeInBytes=align(info.SizeInBytes,65536); hd.Properties=custom; hd.Alignment=65536; hd.Flags=D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
-+ hr=c.device->CreateHeap(&hd,IID_PPV_ARGS(&heap)); if(SUCCEEDED(hr)){c.keep(heap);hr=c.device->CreatePlacedResource(heap.Get(),0,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&r));} }
-+ else hr=c.device->CreateCommittedResource(&custom,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&r));
++ if(placed) { c.crumb("GetResourceAllocationInfo","placement=placed"); auto info=c.device->GetResourceAllocationInfo(0,1,&desc); D3D12_HEAP_DESC hd={}; hd.SizeInBytes=align(info.SizeInBytes,65536); hd.Properties=custom; hd.Alignment=65536; hd.Flags=D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
++ c.crumbHeap("committed-cpu-placed",hd);
++ hr=c.device->CreateHeap(&hd,IID_PPV_ARGS(&heap)); if(SUCCEEDED(hr)){c.keep(heap);c.crumb("CreatePlacedResource","what=texture placement=placed heapOffset=0 width=256 height=256 format=%u state=0x0",(UINT)desc.Format);hr=c.device->CreatePlacedResource(heap.Get(),0,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&r));} }
++ else { c.crumb("CreateCommittedResource","what=texture placement=committed type=%u cpuPage=%u pool=%u width=256 height=256 format=%u state=0x0",(UINT)custom.Type,(UINT)custom.CPUPageProperty,(UINT)custom.MemoryPoolPreference,(UINT)desc.Format);
++ hr=c.device->CreateCommittedResource(&custom,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&r)); }
 + if(FAILED(hr)) { unavailable("texture-creation",hr); return; }
 + c.keep(r);
 + if(placed){ if(!c.begin())return; c.activate(r.Get()); if(!c.submit("committed-cpu-placed-activate"))return; }
-+ hr=r->Map(0,nullptr,nullptr); if(FAILED(hr)) { unavailable("Map(texture)",hr); return; }
++ c.crumb("Resource.Map","what=texture placement=%s",label); hr=r->Map(0,nullptr,nullptr); if(FAILED(hr)) { unavailable("Map(texture)",hr); return; }
 + const UINT count=256*256,pitch=256*4,slice=pitch*256; std::vector<UINT> expected(count),got(count);
 + for(UINT i=0;i<count;++i)expected[i]=word(i,DXGI_FORMAT_R8G8B8A8_UNORM);
-+ hr=r->WriteToSubresource(0,nullptr,expected.data(),pitch,slice);
++ c.crumb("WriteToSubresource","placement=%s",label); hr=r->WriteToSubresource(0,nullptr,expected.data(),pitch,slice);
 + if(FAILED(hr)) { unavailable("WriteToSubresource",hr); r->Unmap(0,nullptr); return; }
 + auto check=[&](const char*step) {
-+ std::fill(got.begin(),got.end(),0xdeadbeefu); HRESULT rh=r->ReadFromSubresource(got.data(),pitch,slice,0,nullptr);
++ std::fill(got.begin(),got.end(),0xdeadbeefu); c.crumb("ReadFromSubresource","placement=%s step=%s",label,step); HRESULT rh=r->ReadFromSubresource(got.data(),pitch,slice,0,nullptr);
 + if(FAILED(rh)){c.log("COMMITTED_CPU_UNAVAILABLE placement=%s reason=ReadFromSubresource step=%s hr=0x%08lx",label,step,(unsigned long)rh);return false;}
 + UINT changed=0,first=UINT_MAX,last=0; for(UINT i=0;i<count;++i)if(got[i]!=expected[i]){if(first==UINT_MAX)first=i;last=i;++changed;}
 + c.log("COMMITTED_CPU placement=%s step=%s changedTexels=%u firstIndex=%d lastIndex=%d",label,step,changed,changed?(int)first:-1,changed?(int)last:-1);
@@ -22252,26 +22295,28 @@ index 0000000..62cd69e
 + const struct { D3D12_RESOURCE_STATES next; const char*name; } steps[]={{D3D12_RESOURCE_STATE_COPY_DEST,"to_COPY_DEST"},{D3D12_RESOURCE_STATE_COPY_SOURCE,"to_COPY_SOURCE"},
 + {D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,"to_PIXEL_SHADER_RESOURCE"},{D3D12_RESOURCE_STATE_COPY_DEST,"to_COPY_DEST_2"},{D3D12_RESOURCE_STATE_COMMON,"to_COMMON"}};
 + for(const auto&s:steps) { if(!ok||c.fatal)break; if(!c.begin())break; c.transition(r.Get(),state,s.next); state=s.next; if(!c.submit(s.name))break; ok=check(s.name); }
-+ if(!c.fatal)r->Unmap(0,nullptr);
++ if(!c.fatal){c.crumb("Resource.Unmap","what=texture placement=%s",label);r->Unmap(0,nullptr);}
 +}
 +// [C] Default-heap committed control: is the destination or the upload source damaged?
 +void committedDefaultCase(Context&c) {
 + auto desc=texture(256,256,DXGI_FORMAT_R8G8B8A8_UNORM,false); D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp={}; UINT rowsN=0; U64 rowSize=0,total=0;
++ c.crumb("GetCopyableFootprints","what=committed-default");
 + c.device->GetCopyableFootprints(&desc,0,1,0,&fp,&rowsN,&rowSize,&total);
 + const UINT count=256*256; std::vector<unsigned char> staging((size_t)total,0); std::vector<UINT> expected(count);
 + for(UINT i=0;i<count;++i){expected[i]=word(i,DXGI_FORMAT_R8G8B8A8_UNORM);memcpy(&staging[(size_t)fp.Offset+(i/256)*fp.Footprint.RowPitch+(i%256)*4],&expected[i],4);}
 + auto upload=qbuf(c,total,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ), readback=qbuf(c,total,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
 + if(!upload||!readback||!qfill(c,upload.Get(),staging))return;
 + ComPtr<ID3D12Resource> tex; auto heap=props(D3D12_HEAP_TYPE_DEFAULT);
++ c.crumb("CreateCommittedResource","what=texture placement=default width=256 height=256 format=%u state=0x0",(UINT)desc.Format);
 + if(!c.checked(c.device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&tex)),"CreateCommittedResource(default texture)"))return;
 + c.keep(tex);
 + D3D12_TEXTURE_COPY_LOCATION image={}; image.pResource=tex.Get(); image.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 + D3D12_TEXTURE_COPY_LOCATION buf={}; buf.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; buf.PlacedFootprint=fp;
 + if(!c.begin())return; c.transition(tex.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
-+ buf.pResource=upload.Get(); c.list->CopyTextureRegion(&image,0,0,0,&buf,nullptr); if(!c.submit("committed-default-upload"))return;
++ buf.pResource=upload.Get(); c.crumb("CopyTextureRegion","what=upload-to-texture"); c.list->CopyTextureRegion(&image,0,0,0,&buf,nullptr); if(!c.submit("committed-default-upload"))return;
 + std::vector<unsigned char> sourceAfterUpload,sourceFinal,result; if(!c.read(upload.Get(),total,sourceAfterUpload))return;
 + if(!c.begin())return; c.transition(tex.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE);
-+ buf.pResource=readback.Get(); c.list->CopyTextureRegion(&buf,0,0,0,&image,nullptr); if(!c.submit("committed-default-readback"))return;
++ buf.pResource=readback.Get(); c.crumb("CopyTextureRegion","what=texture-to-readback"); c.list->CopyTextureRegion(&buf,0,0,0,&image,nullptr); if(!c.submit("committed-default-readback"))return;
 + if(!c.read(readback.Get(),total,result)||!c.read(upload.Get(),total,sourceFinal))return;
 + bool intact1=sourceAfterUpload==staging,intact2=sourceFinal==staging; UINT changed=0; int first=-1; UINT lastActual=0,uploadLast=0;
 + for(UINT i=0;i<count;++i){UINT v=0;memcpy(&v,&result[(size_t)fp.Offset+(i/256)*fp.Footprint.RowPitch+(i%256)*4],4);if(v!=expected[i]){if(first<0)first=(int)i;++changed;}if(i==count-1)lastActual=v;}
@@ -22288,13 +22333,16 @@ index 0000000..62cd69e
 + if(!payloadBuffer||!init||!qfill(c,payloadBuffer.Get(),payload)||!qfill(c,init.Get(),guard))return;
 + const char*names[4]={"D1","D2","D3","D4"};
 + const char*descriptions[4]={"init-copy-then-overlapping-payload-copy-same-list-no-barrier","same-copies-in-separate-ExecuteCommandLists-with-fence","same-list-UAV-barrier-with-null-resource-between","payload-copied-to-a-different-non-overlapping-buffer"};
++ const bool crumbsOn=c.crumbs;
 + for(int v=0;v<4&&!c.fatal;++v) {
 + c.log("COPY_ORDER_VARIANT variant=%s description=%s payloadBytes=%llu prefix=%u tail=%u",names[v],descriptions[v],n,Prefix,Tail);
 + UINT failures=0;
 + for(UINT r=1;r<=repetitions&&!c.fatal;++r) {
++ c.crumbs=crumbsOn&&r==1; // breadcrumbs for the first repetition of each variant only
 + auto padded=qbuf(c,size,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST); ComPtr<ID3D12Resource> other;
 + if(v==3)other=qbuf(c,n,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
 + if(!padded||(v==3&&!other)||!c.begin())return;
++ c.crumb("CopyBufferRegion","variant=%s repetition=%u what=init-and-payload copies",names[v],r);
 + c.list->CopyBufferRegion(padded.Get(),0,init.Get(),0,size);
 + if(v==1){ if(!c.submit("copy-order-init")||!c.begin())return; }
 + if(v==2){ D3D12_RESOURCE_BARRIER b={}; b.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; b.UAV.pResource=nullptr; c.list->ResourceBarrier(1,&b); }
@@ -22307,6 +22355,7 @@ index 0000000..62cd69e
 + bool fail=bad||guardBad; if(fail)++failures;
 + c.log("COPY_ORDER variant=%s repetition=%u result=%s badBytes=%llu firstBadOffset=%lld guardBadBytes=%llu",names[v],r,fail?"FAIL":"PASS",bad,firstBad,guardBad);
 + }
++ c.crumbs=crumbsOn;
 + c.result.copyOrderFailures[v]+=failures; c.log("COPY_ORDER_SUMMARY variant=%s failures=%u/%u",names[v],failures,repetitions);
 + }
 +}
@@ -22337,26 +22386,216 @@ index 0000000..62cd69e
 + c.log("SUMMARY cases=%u mismatches=%u unavailable=%u selfTestsFailed=%u deviceFailed=%u debugErrors=%u pendingResourcesRetained=%u",c.result.casesCompleted,c.result.mismatchCases,c.result.unavailableCases,c.result.selfTestsFailed,c.result.deviceFailed,c.result.debugErrors,c.fatal);
 + Result result=c.result;if(!c.fatal)delete context;return result;
 +}
-+static Result runDefault(const Options&requested,LogSink sink,void*user) {
-+ // One pass on one device with DRED forced off; the minimal repro owns its own device and runs first.
-+ Options options=requested; options.dredEnabled=false;
-+ ReproStatus repro; int reproFailures=RunMinimalRepro(sink,user,options.warp,&repro);
-+ auto context=new Context(options,sink,user); Context&c=*context;
-+ c.result.reproFailures=(unsigned)reproFailures; c.result.unavailableCases+=repro.unavailableVariants; c.result.deviceFailed=repro.deviceFailed;
-+ c.logFences=false;
-+ if(c.initialize()) {
-+ runMapSuite(c); if(!c.fatal)c.retained.clear();
-+ if(!c.fatal)committedCpuCase(c,false); if(!c.fatal)committedCpuCase(c,true); if(!c.fatal)committedDefaultCase(c);
-+ if(!c.fatal)c.retained.clear();
-+ if(!c.fatal)copyOrderSuite(c);
-+ if(options.injection==Injection::MapOutsideWord&&!c.result.injectionsAttempted){++c.result.selfTestsFailed;c.log("SELF_TEST_FAIL requested map injection was not exercised");}
-+ c.inspectDebug();
++// ---------------------------------------------------------------------------------
++// Supervision of the default suite. Every stage runs behind an SEH guard (MSVC), a watchdog thread reports
++// a stall, and all log lines pass through a tracker that remembers the last line and when it was written.
++// The tracker uses its own mutex, which is never held while the real sink is called, so the watchdog
++// cannot deadlock with the sink's mutex. Nothing here terminates anything.
++// ---------------------------------------------------------------------------------
++namespace {
++using StageFn=void(*)(void*);
++constexpr unsigned WatchdogSeconds=5;
++struct Supervisor {
++ LogSink sink=nullptr; void* user=nullptr;
++ std::mutex lineMutex; char lastLine[161]=""; // first 160 characters of the last tracked line
++ std::atomic<ULONGLONG> lastTick{0};
++ std::atomic<const char*> stage{"startup"}; // always a string literal
++ std::atomic<unsigned> watchdogReports{0};
++ std::atomic<bool> stopping{false};
++ std::mutex waitMutex; std::condition_variable wake; std::thread thread;
++ LPTOP_LEVEL_EXCEPTION_FILTER previousFilter=nullptr; bool filterInstalled=false;
++ ~Supervisor();
++};
++std::atomic<Supervisor*> activeSupervisor{nullptr};
++void trackedLog(void*context,const char*line) {
++ auto*s=static_cast<Supervisor*>(context);
++ { std::lock_guard<std::mutex> lock(s->lineMutex); snprintf(s->lastLine,sizeof(s->lastLine),"%s",line); }
++ s->lastTick=GetTickCount64();
++ if(s->sink)s->sink(s->user,line);
++}
++// SEH line: stage, code, address, and the module (file name only) and offset the address falls in.
++void reportFault(Supervisor*s,const char*handler,DWORD code,const void*address) {
++ HMODULE module=nullptr; char name[128]="unknown"; unsigned long long offset=(unsigned long long)(uintptr_t)address;
++ if(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCWSTR>(address),&module)&&module) {
++ wchar_t path[MAX_PATH]=L""; if(GetModuleFileNameW(module,path,MAX_PATH)) {
++ const wchar_t*base=path; for(const wchar_t*c=path;*c;++c)if(*c==L'\\'||*c==L'/')base=c+1;
++ if(!WideCharToMultiByte(CP_UTF8,0,base,-1,name,sizeof(name),nullptr,nullptr))snprintf(name,sizeof(name),"unknown"); }
++ offset=(unsigned long long)((uintptr_t)address-(uintptr_t)module); }
++ char text[512]; snprintf(text,sizeof(text),"SEH stage=%s code=0x%08lx address=0x%llx module=%s offset=0x%llx handler=%s thread=%lu",
++ s->stage.load(),(unsigned long)code,(unsigned long long)(uintptr_t)address,name,offset,handler,(unsigned long)GetCurrentThreadId());
++ s->lastTick=GetTickCount64(); if(s->sink)s->sink(s->user,text);
++}
++// Exceptions outside a guarded stage (other threads); the process then continues to its normal fate.
++LONG WINAPI unhandledFilter(EXCEPTION_POINTERS*e) {
++ Supervisor*s=activeSupervisor.load(); if(s&&e&&e->ExceptionRecord)reportFault(s,"unhandled-filter",e->ExceptionRecord->ExceptionCode,e->ExceptionRecord->ExceptionAddress);
++ return EXCEPTION_CONTINUE_SEARCH;
++}
++#if defined(_MSC_VER)
++// Plain function pointer plus void*: the __try function has no C++ objects that need unwinding (/EHsc safe).
++int stageFilter(EXCEPTION_POINTERS*e) {
++ Supervisor*s=activeSupervisor.load(); if(s)reportFault(s,"stage-guard",e->ExceptionRecord->ExceptionCode,e->ExceptionRecord->ExceptionAddress);
++ return EXCEPTION_EXECUTE_HANDLER;
++}
++bool callGuarded(StageFn fn,void*context) {
++ __try { fn(context); return true; }
++ __except(stageFilter(GetExceptionInformation())) { return false; }
++}
++#else
++bool callGuarded(StageFn fn,void*context) { fn(context); return true; } // no SEH off MSVC (syntax checks only)
++#endif
++void watchdogMain(Supervisor*s) {
++ ULONGLONG seen=s->lastTick.load(); unsigned next=WatchdogSeconds;
++ std::unique_lock<std::mutex> lock(s->waitMutex);
++ while(!s->stopping) {
++ if(s->wake.wait_for(lock,std::chrono::seconds(1),[&]{return s->stopping.load();}))break;
++ const ULONGLONG tick=s->lastTick.load(); if(tick!=seen){seen=tick;next=WatchdogSeconds;}
++ const unsigned idle=(unsigned)((GetTickCount64()-tick)/1000);
++ if(idle<next)continue;
++ next=(idle/WatchdogSeconds+1)*WatchdogSeconds;
++ lock.unlock(); // the sink is called without any of our locks held except the brief copy below
++ char last[sizeof(s->lastLine)]; { std::lock_guard<std::mutex> line(s->lineMutex); memcpy(last,s->lastLine,sizeof(last)); }
++ char text[256]; snprintf(text,sizeof(text),"WATCHDOG idleSeconds=%u lastLine=%.160s",idle,last);
++ ++s->watchdogReports; if(s->sink)s->sink(s->user,text); // deliberately not tracked: idleSeconds keeps counting up
++ lock.lock();
 + }
-+ const Result&r=c.result;
-+ c.log("MAP_SUMMARY reproFailures=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u deviceFailed=%u mapCasesRun=%u committedDefaultChanged=%u uploadSourceDamaged=%u injectionsAttempted=%u injectionsDetected=%u debugErrors=%u pendingResourcesRetained=%u",
++}
++void startSupervisor(Supervisor&s,LogSink sink,void*user) {
++ s.sink=sink; s.user=user; s.lastTick=GetTickCount64(); activeSupervisor=&s;
++ s.previousFilter=SetUnhandledExceptionFilter(unhandledFilter); s.filterInstalled=true;
++ s.thread=std::thread(watchdogMain,&s);
++}
++void stopSupervisor(Supervisor&s) {
++ if(s.thread.joinable()) { { std::lock_guard<std::mutex> lock(s.waitMutex); s.stopping=true; } s.wake.notify_all(); s.thread.join(); }
++ if(s.filterInstalled){SetUnhandledExceptionFilter(s.previousFilter);s.filterInstalled=false;}
++ activeSupervisor=nullptr;
++}
++Supervisor::~Supervisor() { stopSupervisor(*this); }
++
++enum class Outcome { Completed, Seh, DeviceFailed, Unavailable };
++const char* outcomeName(Outcome o) { return o==Outcome::Completed?"completed":o==Outcome::Seh?"seh":o==Outcome::DeviceFailed?"device-failed":"unavailable"; }
++struct Pipeline {
++ Options options; Supervisor*sup=nullptr; Result total;
++ Context*ctx=nullptr; // device shared by B, C and D; replaced after an SEH exception or device failure
++ unsigned leaked=0;   // abandoned contexts whose objects were deliberately leaked
++};
++struct StageCall { Pipeline*p; unsigned id; Outcome outcome=Outcome::Completed; };
++void plog(Pipeline&p,const char*fmt,...) {
++ char text[512]; va_list ap; va_start(ap,fmt); vsnprintf(text,sizeof(text),fmt,ap); va_end(ap); trackedLog(p.sup,text);
++}
++void mergeResult(Result&d,const Result&s) {
++ d.casesCompleted+=s.casesCompleted; d.mismatchCases+=s.mismatchCases; d.unavailableCases+=s.unavailableCases; d.selfTestsFailed+=s.selfTestsFailed;
++ d.deviceFailed|=s.deviceFailed; d.debugErrors|=s.debugErrors; d.reproFailures+=s.reproFailures; d.mapCasesRun+=s.mapCasesRun;
++ d.mapCasesWithOutsideWrites+=s.mapCasesWithOutsideWrites; d.committedCpuChanged+=s.committedCpuChanged; d.committedDefaultChanged+=s.committedDefaultChanged;
++ d.uploadSourceDamaged+=s.uploadSourceDamaged; for(int i=0;i<4;++i)d.copyOrderFailures[i]+=s.copyOrderFailures[i];
++ d.injectionsAttempted+=s.injectionsAttempted; d.injectionsDetected+=s.injectionsDetected;
++}
++// Folds the shared context into the totals and drops it. A context that saw an SEH exception or a device
++// failure is leaked: its GPU objects may still be referenced and must never be destroyed.
++void abandonContext(Pipeline&p,bool leak) {
++ if(!p.ctx)return;
++ mergeResult(p.total,p.ctx->result);
++ if(leak)++p.leaked; else delete p.ctx;
++ p.ctx=nullptr;
++}
++#if defined(_MSC_VER)
++volatile int*volatile selfTestTarget=nullptr; // volatile so the compiler cannot elide or fold the faulting write
++#endif
++void selfTestStage(void*context) {
++ auto*sc=static_cast<StageCall*>(context);
++#if defined(_MSC_VER)
++ plog(*sc->p,"SELF_TEST_SEH raising an access violation (write to nullptr) inside the guarded stage");
++ *selfTestTarget=1;
++#else
++ plog(*sc->p,"SELF_TEST_SEH unavailable (SEH needs MSVC)");
++#endif
++}
++void probeStage(void*context) {
++ auto*sc=static_cast<StageCall*>(context); Pipeline&p=*sc->p; ProbeStatus status;
++ RunFirstUseProbe(sc->id,trackedLog,p.sup,p.options.warp,&status);
++ if(status.completed)++p.total.probesCompleted;
++ if(status.deviceFailed){p.total.deviceFailed=true;sc->outcome=Outcome::DeviceFailed;}
++ else if(status.unavailable)sc->outcome=Outcome::Unavailable;
++}
++void reproStage(void*context) {
++ auto*sc=static_cast<StageCall*>(context); Pipeline&p=*sc->p; ReproStatus status;
++ p.total.reproFailures=(unsigned)RunMinimalRepro(trackedLog,p.sup,p.options.warp,&status);
++ p.total.unavailableCases+=status.unavailableVariants;
++ if(status.deviceFailed){p.total.deviceFailed=true;sc->outcome=Outcome::DeviceFailed;}
++ else if(status.unavailableVariants)sc->outcome=Outcome::Unavailable;
++}
++// Returns the shared context, creating (and initializing) a fresh device if there is none.
++Context* acquire(StageCall&sc,const char*stage) {
++ Pipeline&p=*sc.p;
++ if(!p.ctx) {
++ auto*c=new Context(p.options,trackedLog,p.sup); c->crumbs=true; c->logFences=false; c->stage=stage; p.ctx=c;
++ if(!c->initialize()) { sc.outcome=(c->fatal||c->result.deviceFailed)?Outcome::DeviceFailed:Outcome::Unavailable; return nullptr; }
++ }
++ p.ctx->stage=stage; return p.ctx;
++}
++void mapStage(void*context) {
++ auto*sc=static_cast<StageCall*>(context); Context*c=acquire(*sc,"B"); if(!c)return;
++ const unsigned ran=c->result.mapCasesRun,unavailable=c->result.unavailableCases;
++ runMapSuite(*c); if(!c->fatal)c->retained.clear();
++ if(c->fatal)sc->outcome=Outcome::DeviceFailed;
++ else if(c->result.mapCasesRun==ran&&c->result.unavailableCases>unavailable)sc->outcome=Outcome::Unavailable;
++}
++void committedStage(void*context) {
++ auto*sc=static_cast<StageCall*>(context); Context*c=acquire(*sc,"C"); if(!c)return;
++ committedCpuCase(*c,false); if(!c->fatal)committedCpuCase(*c,true); if(!c->fatal)committedDefaultCase(*c);
++ if(!c->fatal)c->retained.clear();
++ if(c->fatal)sc->outcome=Outcome::DeviceFailed;
++}
++void copyOrderStage(void*context) {
++ auto*sc=static_cast<StageCall*>(context); Context*c=acquire(*sc,"D"); if(!c)return;
++ copyOrderSuite(*c); c->inspectDebug();
++ if(c->fatal)sc->outcome=Outcome::DeviceFailed;
++}
++void runStage(Pipeline&p,const char*name,StageFn fn,StageCall&sc) {
++ p.sup->stage=name; plog(p,"STAGE_BEGIN stage=%s",name);
++ if(!callGuarded(fn,&sc)) { sc.outcome=Outcome::Seh; ++p.total.sehStages; }
++ if(sc.outcome!=Outcome::Completed)++p.total.stagesIncomplete;
++ plog(p,"STAGE_END stage=%s result=%s",name,outcomeName(sc.outcome));
++ p.sup->stage="between-stages";
++}
++void runSharedStage(Pipeline&p,const char*name,StageFn fn) {
++ StageCall sc{&p,0}; runStage(p,name,fn,sc);
++ if(!p.ctx)return;
++ // After an SEH exception or a device failure the next stage starts on a fresh device; this one is leaked.
++ if(sc.outcome==Outcome::Seh||sc.outcome==Outcome::DeviceFailed||p.ctx->fatal)abandonContext(p,true);
++ else if(sc.outcome==Outcome::Unavailable&&!p.ctx->device)abandonContext(p,false); // initialization never got a device
++}
++} // namespace
++static Result runDefault(const Options&options,LogSink sink,void*user) {
++ // One pass. Each stage runs behind an SEH guard; B, C and D share a device that is replaced by a fresh
++ // one after an SEH exception or a device failure. Probes and the repro always create their own device.
++ Supervisor sup; startSupervisor(sup,sink,user);
++ Pipeline p; p.options=options; p.sup=&sup;
++#if defined(_MSC_VER)
++ const unsigned sehGuard=1;
++#else
++ const unsigned sehGuard=0;
++#endif
++ plog(p,"SUPERVISOR sehGuard=%u watchdogSeconds=%u selfTestSeh=%u dredUntouched=%u",sehGuard,WatchdogSeconds,options.selfTestSeh,!options.dredExplicit);
++ if(options.selfTestSeh){StageCall sc{&p,0};runStage(p,"self-test",selfTestStage,sc);}
++ static const char*const probeNames[]={"P1","P2","P3","P4","P5"};
++ for(unsigned id=1;id<=5;++id){StageCall sc{&p,id};runStage(p,probeNames[id-1],probeStage,sc);}
++ {StageCall sc{&p,0};runStage(p,"A",reproStage,sc);}
++ runSharedStage(p,"B",mapStage);
++ runSharedStage(p,"C",committedStage);
++ runSharedStage(p,"D",copyOrderStage);
++ const bool liveFatal=p.ctx&&p.ctx->fatal;
++ Context*live=p.ctx;
++ if(live)mergeResult(p.total,live->result);
++ if(options.injection==Injection::MapOutsideWord&&!p.total.injectionsAttempted){++p.total.selfTestsFailed;plog(p,"SELF_TEST_FAIL requested map injection was not exercised");}
++ stopSupervisor(sup); // no WATCHDOG line may follow the summary
++ p.total.watchdogReports=sup.watchdogReports;
++ const Result&r=p.total; char summary[1536];
++ snprintf(summary,sizeof(summary),"MAP_SUMMARY reproFailures=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u deviceFailed=%u mapCasesRun=%u committedDefaultChanged=%u uploadSourceDamaged=%u injectionsAttempted=%u injectionsDetected=%u debugErrors=%u pendingResourcesRetained=%u sehStages=%u stagesIncomplete=%u probesCompleted=%u watchdogReports=%u",
 + r.reproFailures,r.mapCasesWithOutsideWrites,r.unavailableCases,r.committedCpuChanged,r.copyOrderFailures[0],r.copyOrderFailures[1],r.copyOrderFailures[2],r.copyOrderFailures[3],
-+ r.selfTestsFailed,r.deviceFailed,r.mapCasesRun,r.committedDefaultChanged,r.uploadSourceDamaged,r.injectionsAttempted,r.injectionsDetected,r.debugErrors,c.fatal);
-+ Result result=c.result; if(!c.fatal)delete context; return result;
++ r.selfTestsFailed,r.deviceFailed,r.mapCasesRun,r.committedDefaultChanged,r.uploadSourceDamaged,r.injectionsAttempted,r.injectionsDetected,r.debugErrors,p.leaked+(liveFatal?1u:0u),
++ r.sehStages,r.stagesIncomplete,r.probesCompleted,r.watchdogReports);
++ if(sink)sink(user,summary);
++ Result result=p.total; if(live&&!liveFatal)delete live; return result;
 +}
 +Result Run(const Options&options,LogSink sink,void*user) {
 + return options.legacySuite?runLegacy(options,sink,user):runDefault(options,sink,user);
@@ -22364,10 +22603,10 @@ index 0000000..62cd69e
 +} // namespace rrdiag
 diff --git a/src/hardware/r_d3d12/isolation/isolation.h b/src/hardware/r_d3d12/isolation/isolation.h
 new file mode 100644
-index 0000000..971cfe6
+index 0000000..77eeb85
 --- /dev/null
 +++ b/src/hardware/r_d3d12/isolation/isolation.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,47 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// Independent D3D12 placement diagnostics; no engine or host dependencies.
 +#pragma once
@@ -22375,6 +22614,11 @@ index 0000000..971cfe6
 +enum class Injection { None, SentinelFirstWordZero, OwnerLastWordZero, MapOutsideWord };
 +struct Options {
 + bool warp=false, debug=false, gpuValidation=false, dredEnabled=false, quick=false;
++ // The default suite leaves ID3D12DeviceRemovedExtendedDataSettings untouched unless this is set (the
++ // legacy suite always configures it). Not touching it matches the conditions of the failing Xbox run.
++ bool dredExplicit=false;
++ // Console only: add a first stage that raises an access violation to exercise the SEH guard.
++ bool selfTestSeh=false;
 + // Run the original 408-case sentinel matrix instead of the default suite.
 + bool legacySuite=false;
 + unsigned repeats=2;
@@ -22388,6 +22632,9 @@ index 0000000..971cfe6
 + unsigned committedCpuChanged=0, committedDefaultChanged=0, uploadSourceDamaged=0;
 + unsigned copyOrderFailures[4]={0,0,0,0};
 + unsigned injectionsAttempted=0, injectionsDetected=0;
++ // Stage supervision: stages ending in an SEH exception, stages not "completed", first-use probes that
++ // completed all their steps, and WATCHDOG lines written.
++ unsigned sehStages=0, stagesIncomplete=0, probesCompleted=0, watchdogReports=0;
 +};
 +using LogSink=void(*)(void*,const char*);
 +// Runs the default suite (or the legacy matrix when requested).
@@ -22399,13 +22646,20 @@ index 0000000..971cfe6
 +// Self-contained minimal reproduction on its own fresh device (see minimal_repro.cpp).
 +// Returns the number of failing checks. Needs only d3d12/dxgi.
 +int RunMinimalRepro(LogSink,void*,bool warp=false,ReproStatus* status=nullptr);
++struct ProbeStatus {
++ bool completed=false;    // every step of the probe succeeded
++ bool deviceFailed=false; // device creation failed, the device was removed, or a GPU wait timed out
++ bool unavailable=false;  // no suitable adapter
++};
++// First-use probe 1..5 (see minimal_repro.cpp), each on its own brand-new device.
++void RunFirstUseProbe(unsigned id,LogSink,void*,bool warp,ProbeStatus* status);
 +}
 diff --git a/src/hardware/r_d3d12/isolation/minimal_repro.cpp b/src/hardware/r_d3d12/isolation/minimal_repro.cpp
 new file mode 100644
-index 0000000..88ed6c7
+index 0000000..ed6a043
 --- /dev/null
 +++ b/src/hardware/r_d3d12/isolation/minimal_repro.cpp
-@@ -0,0 +1,624 @@
+@@ -0,0 +1,1070 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +//
 +// Minimal Direct3D 12 reproduction of a placed-resource memory-corruption problem
@@ -22447,6 +22701,14 @@ index 0000000..88ed6c7
 +// A check fails if word0 or any other word of the neighbouring buffer differs from the
 +// pattern (extra detail lines start with REPRO_DETAIL). The function returns the number
 +// of failing checks (or API failures) and logs "REPRO_SUMMARY failures=<n>".
++//
++// Breadcrumbs: before every D3D12/DXGI call a flushed line
++//   CALL stage=<stage> api=<name> <key arguments>
++// is logged, so the last CALL line names the call that crashed or hung the process. Nothing is
++// logged between CreatePlacedResource(texture) and the observation that immediately follows it.
++//
++// The file also holds the first-use probes (RunFirstUseProbe): five tiny experiments, each on its own
++// brand-new device, that test what makes the first CUSTOM heap use fail on Xbox (see the end).
 +//
 +// Only d3d12/dxgi and the C++ runtime are used; the file can be built on its own.
 +#include "isolation.h"
@@ -22516,6 +22778,111 @@ index 0000000..88ed6c7
 +	return desc;
 +}
 +
++// Log output shared by the repro and the probes, including the CALL breadcrumbs.
++class Out
++{
++public:
++	Out(LogSink sink, void* user, const char* stage) : sink_(sink), user_(user), stage_(stage) {}
++
++	void Log(const char* format, ...)
++	{
++		char text[1024];
++		va_list args;
++		va_start(args, format);
++		std::vsnprintf(text, sizeof(text), format, args);
++		va_end(args);
++		if (sink_)
++			sink_(user_, text);
++	}
++	// Logged immediately before the named call.
++	void Call(const char* api) { Log("CALL stage=%s api=%s", stage_, api); }
++	void CallF(const char* api, const char* format, ...)
++	{
++		char detail[768];
++		va_list args;
++		va_start(args, format);
++		std::vsnprintf(detail, sizeof(detail), format, args);
++		va_end(args);
++		Log("CALL stage=%s api=%s %s", stage_, api, detail);
++	}
++
++protected:
++	LogSink sink_;
++	void* user_;
++	const char* stage_;
++};
++
++const char* DimensionName(D3D12_RESOURCE_DIMENSION dimension)
++{
++	switch (dimension)
++	{
++	case D3D12_RESOURCE_DIMENSION_BUFFER: return "BUFFER";
++	case D3D12_RESOURCE_DIMENSION_TEXTURE1D: return "TEXTURE1D";
++	case D3D12_RESOURCE_DIMENSION_TEXTURE2D: return "TEXTURE2D";
++	case D3D12_RESOURCE_DIMENSION_TEXTURE3D: return "TEXTURE3D";
++	default: return "UNKNOWN";
++	}
++}
++
++void HeapText(const D3D12_HEAP_PROPERTIES& heap, char (&text)[128])
++{
++	std::snprintf(text, sizeof(text), "type=%u cpuPage=%u pool=%u creationNode=%u visibleNode=%u",
++		static_cast<unsigned>(heap.Type), static_cast<unsigned>(heap.CPUPageProperty), static_cast<unsigned>(heap.MemoryPoolPreference),
++		static_cast<unsigned>(heap.CreationNodeMask), static_cast<unsigned>(heap.VisibleNodeMask));
++}
++
++void DescText(const D3D12_RESOURCE_DESC& desc, char (&text)[192])
++{
++	std::snprintf(text, sizeof(text), "dimension=%s width=%llu height=%u depthOrArray=%u mips=%u format=%u layout=%u flags=0x%x",
++		DimensionName(desc.Dimension), static_cast<U64>(desc.Width), static_cast<unsigned>(desc.Height),
++		static_cast<unsigned>(desc.DepthOrArraySize), static_cast<unsigned>(desc.MipLevels), static_cast<unsigned>(desc.Format),
++		static_cast<unsigned>(desc.Layout), static_cast<unsigned>(desc.Flags));
++}
++
++// The full suite's adapter choice, shared by the repro and the probes: WARP when asked, otherwise the first
++// non-software adapter that can create a D3D12 device. Returns a failing HRESULT (and the API that failed);
++// with S_OK and no adapter there is no suitable hardware adapter.
++HRESULT SelectAdapter(Out& out, bool warp, ComPtr<IDXGIFactory4>& factory, ComPtr<IDXGIAdapter1>& adapter, const char** failedApi)
++{
++	out.Call("CreateDXGIFactory2");
++	HRESULT hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
++	if (FAILED(hr))
++	{
++		*failedApi = "CreateDXGIFactory2";
++		return hr;
++	}
++	if (warp)
++	{
++		out.Call("EnumWarpAdapter");
++		hr = factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
++		if (FAILED(hr))
++			*failedApi = "EnumWarpAdapter";
++		return hr;
++	}
++	for (UINT index = 0;; ++index)
++	{
++		ComPtr<IDXGIAdapter1> candidate;
++		out.CallF("EnumAdapters1", "index=%u", index);
++		hr = factory->EnumAdapters1(index, &candidate);
++		if (hr == DXGI_ERROR_NOT_FOUND)
++			break;
++		if (FAILED(hr))
++			continue;
++		DXGI_ADAPTER_DESC1 desc = {};
++		out.CallF("IDXGIAdapter1.GetDesc1", "index=%u", index);
++		candidate->GetDesc1(&desc);
++		if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
++			continue;
++		out.CallF("D3D12CreateDevice", "adapterIndex=%u featureLevel=0x%x device=null", index, static_cast<unsigned>(D3D_FEATURE_LEVEL_11_0));
++		if (SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr)))
++		{
++			adapter = candidate;
++			break;
++		}
++	}
++	return S_OK;
++}
++
 +// What one check observed in the neighbouring buffer.
 +struct Observation
 +{
@@ -22524,11 +22891,11 @@ index 0000000..88ed6c7
 +	UINT firstChangedWord = 0;
 +};
 +
-+class Repro
++class Repro : public Out
 +{
 +public:
 +	Repro(LogSink sink, void* user, bool warp, ReproStatus* status)
-+		: sink_(sink), user_(user), warp_(warp), status_(status) {}
++		: Out(sink, user, "A"), warp_(warp), status_(status) {}
 +	~Repro()
 +	{
 +		if (event_)
@@ -22541,7 +22908,6 @@ index 0000000..88ed6c7
 +	bool Fatal() const { return fatal_; }
 +
 +private:
-+	void Log(const char* format, ...);
 +	bool Api(HRESULT hr, const char* api);
 +	void Unavailable(const char* variant, const char* reason);
 +	bool Initialize();
@@ -22564,8 +22930,6 @@ index 0000000..88ed6c7
 +	void RunDefaultHeapVariant();
 +	bool ReadNeighbourThroughGpu(ID3D12Resource* neighbour, ID3D12Resource* readback, Observation& seen);
 +
-+	LogSink sink_;
-+	void* user_;
 +	bool warp_;
 +	ReproStatus* status_;
 +	int failures_ = 0;
@@ -22588,17 +22952,6 @@ index 0000000..88ed6c7
 +	std::vector<ComPtr<IUnknown>> kept_;
 +};
 +
-+void Repro::Log(const char* format, ...)
-+{
-+	char text[1024];
-+	va_list args;
-+	va_start(args, format);
-+	std::vsnprintf(text, sizeof(text), format, args);
-+	va_end(args);
-+	if (sink_)
-+		sink_(user_, text);
-+}
-+
 +// Returns true on success. A failure is logged and counted as a failing check; if the
 +// device was removed, every later variant is skipped.
 +bool Repro::Api(HRESULT hr, const char* api)
@@ -22607,12 +22960,17 @@ index 0000000..88ed6c7
 +		return true;
 +	Log("REPRO_API_FAILURE api=%s hr=0x%08lx", api, static_cast<unsigned long>(hr));
 +	++failures_;
-+	if (device_ && FAILED(device_->GetDeviceRemovedReason()))
++	if (device_)
 +	{
-+		Log("REPRO_DEVICE_REMOVED reason=0x%08lx", static_cast<unsigned long>(device_->GetDeviceRemovedReason()));
-+		fatal_ = true;
-+		if (status_)
-+			status_->deviceFailed = true;
++		Call("GetDeviceRemovedReason");
++		const HRESULT removed = device_->GetDeviceRemovedReason();
++		if (FAILED(removed))
++		{
++			Log("REPRO_DEVICE_REMOVED reason=0x%08lx", static_cast<unsigned long>(removed));
++			fatal_ = true;
++			if (status_)
++				status_->deviceFailed = true;
++		}
 +	}
 +	return false;
 +}
@@ -22626,53 +22984,36 @@ index 0000000..88ed6c7
 +
 +bool Repro::Initialize()
 +{
-+	if (!Api(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)), "CreateDXGIFactory2"))
++	const char* failedApi = nullptr;
++	const HRESULT selectHr = SelectAdapter(*this, warp_, factory_, adapter_, &failedApi);
++	if (FAILED(selectHr))
++	{
++		Api(selectHr, failedApi);
 +		return false;
-+	if (warp_)
-+	{
-+		if (!Api(factory_->EnumWarpAdapter(IID_PPV_ARGS(&adapter_)), "EnumWarpAdapter"))
-+			return false;
 +	}
-+	else
++	if (!adapter_)
 +	{
-+		for (UINT index = 0;; ++index)
-+		{
-+			ComPtr<IDXGIAdapter1> candidate;
-+			const HRESULT hr = factory_->EnumAdapters1(index, &candidate);
-+			if (hr == DXGI_ERROR_NOT_FOUND)
-+				break;
-+			if (FAILED(hr))
-+				continue;
-+			DXGI_ADAPTER_DESC1 desc = {};
-+			candidate->GetDesc1(&desc);
-+			if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
-+				continue;
-+			if (SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr)))
-+			{
-+				adapter_ = candidate;
-+				break;
-+			}
-+		}
-+		if (!adapter_)
-+		{
-+			Log("REPRO_UNAVAILABLE variant=all reason=no-hardware-d3d12-adapter");
-+			if (status_)
-+				status_->unavailableVariants += 2;
-+			return false;
-+		}
++		Log("REPRO_UNAVAILABLE variant=all reason=no-hardware-d3d12-adapter");
++		if (status_)
++			status_->unavailableVariants += 2;
++		return false;
 +	}
 +
 +	DXGI_ADAPTER_DESC1 adapterDesc = {};
++	Call("IDXGIAdapter1.GetDesc1");
 +	adapter_->GetDesc1(&adapterDesc);
 +	char name[256] = {};
 +	WideCharToMultiByte(CP_UTF8, 0, adapterDesc.Description, -1, name, sizeof(name), nullptr, nullptr);
 +
++	CallF("D3D12CreateDevice", "featureLevel=0x%x", static_cast<unsigned>(D3D_FEATURE_LEVEL_11_0));
 +	if (!Api(D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)), "D3D12CreateDevice"))
 +		return false;
 +
 +	D3D12_FEATURE_DATA_ARCHITECTURE architecture = {};
++	Call("CheckFeatureSupport(ARCHITECTURE)");
 +	const HRESULT architectureHr = device_->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture));
 +	D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
++	Call("CheckFeatureSupport(D3D12_OPTIONS)");
 +	const HRESULT optionsHr = device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
 +	uma_ = SUCCEEDED(architectureHr) && architecture.UMA;
 +	cacheCoherentUma_ = SUCCEEDED(architectureHr) && architecture.CacheCoherentUMA;
@@ -22683,12 +23024,22 @@ index 0000000..88ed6c7
 +
 +	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
 +	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-+	if (!Api(device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_)), "CreateCommandQueue") ||
-+		!Api(device_->CreateCommandAllocator(queueDesc.Type, IID_PPV_ARGS(&allocator_)), "CreateCommandAllocator") ||
-+		!Api(device_->CreateCommandList(0, queueDesc.Type, allocator_.Get(), nullptr, IID_PPV_ARGS(&list_)), "CreateCommandList") ||
-+		!Api(list_->Close(), "CommandList.Close") ||
-+		!Api(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence"))
++	Call("CreateCommandQueue");
++	if (!Api(device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_)), "CreateCommandQueue"))
 +		return false;
++	Call("CreateCommandAllocator");
++	if (!Api(device_->CreateCommandAllocator(queueDesc.Type, IID_PPV_ARGS(&allocator_)), "CreateCommandAllocator"))
++		return false;
++	Call("CreateCommandList");
++	if (!Api(device_->CreateCommandList(0, queueDesc.Type, allocator_.Get(), nullptr, IID_PPV_ARGS(&list_)), "CreateCommandList"))
++		return false;
++	Call("CommandList.Close");
++	if (!Api(list_->Close(), "CommandList.Close"))
++		return false;
++	Call("CreateFence");
++	if (!Api(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence"))
++		return false;
++	Call("CreateEventExW");
 +	event_ = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
 +	if (!event_)
 +	{
@@ -22700,24 +23051,34 @@ index 0000000..88ed6c7
 +
 +bool Repro::BeginList()
 +{
-+	return Api(allocator_->Reset(), "CommandAllocator.Reset") && Api(list_->Reset(allocator_.Get(), nullptr), "CommandList.Reset");
++	Call("CommandAllocator.Reset");
++	if (!Api(allocator_->Reset(), "CommandAllocator.Reset"))
++		return false;
++	Call("CommandList.Reset");
++	return Api(list_->Reset(allocator_.Get(), nullptr), "CommandList.Reset");
 +}
 +
 +// Closes and executes the current list and waits for it with a fence. Every GPU step in
 +// this file is fenced, so no work from one step overlaps the next.
 +bool Repro::ExecuteAndWait()
 +{
++	Call("CommandList.Close");
 +	if (!Api(list_->Close(), "CommandList.Close"))
 +		return false;
 +	ID3D12CommandList* lists[] = {list_.Get()};
++	Call("ExecuteCommandLists");
 +	queue_->ExecuteCommandLists(1, lists);
 +	++fenceValue_;
++	CallF("Queue.Signal", "value=%llu", fenceValue_);
 +	if (!Api(queue_->Signal(fence_.Get(), fenceValue_), "Queue.Signal"))
 +		return false;
++	Call("Fence.GetCompletedValue");
 +	if (fence_->GetCompletedValue() < fenceValue_)
 +	{
++		CallF("Fence.SetEventOnCompletion", "value=%llu", fenceValue_);
 +		if (!Api(fence_->SetEventOnCompletion(fenceValue_, event_), "Fence.SetEventOnCompletion"))
 +			return false;
++		CallF("WaitForSingleObjectEx", "fence=%llu timeoutMs=%lu", fenceValue_, static_cast<unsigned long>(kWaitMilliseconds));
 +		if (WaitForSingleObjectEx(event_, kWaitMilliseconds, FALSE) != WAIT_OBJECT_0)
 +		{
 +			Log("REPRO_FATAL_WAIT fence=%llu timeoutMs=%lu", fenceValue_, static_cast<unsigned long>(kWaitMilliseconds));
@@ -22728,6 +23089,7 @@ index 0000000..88ed6c7
 +			return false;
 +		}
 +	}
++	Call("GetDeviceRemovedReason");
 +	return Api(device_->GetDeviceRemovedReason(), "GetDeviceRemovedReason");
 +}
 +
@@ -22739,6 +23101,7 @@ index 0000000..88ed6c7
 +	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 +	barrier.Transition.StateBefore = before;
 +	barrier.Transition.StateAfter = after;
++	CallF("ResourceBarrier", "transition before=0x%x after=0x%x", static_cast<unsigned>(before), static_cast<unsigned>(after));
 +	list_->ResourceBarrier(1, &barrier);
 +}
 +
@@ -22747,6 +23110,10 @@ index 0000000..88ed6c7
 +	ComPtr<ID3D12Resource> buffer;
 +	const D3D12_HEAP_PROPERTIES heap = StandardHeap(type);
 +	const D3D12_RESOURCE_DESC desc = BufferDesc(bytes);
++	char heapText[128], descText[192];
++	HeapText(heap, heapText);
++	DescText(desc, descText);
++	CallF("CreateCommittedResource", "%s heapFlags=0x0 %s state=0x%x", heapText, descText, static_cast<unsigned>(state));
 +	if (Api(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&buffer)),
 +			"CreateCommittedResource(buffer)"))
 +		Keep(buffer);
@@ -22774,6 +23141,7 @@ index 0000000..88ed6c7
 +		Unavailable(variant, "requires-UMA-cache-coherent-UMA-and-resource-heap-tier-2");
 +		return;
 +	}
++	Call("GetCustomHeapProperties");
 +	const D3D12_HEAP_PROPERTIES custom = device_->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_UPLOAD);
 +	Log("REPRO_HEAP variant=%s query=GetCustomHeapProperties(UPLOAD) type=%u cpuPageProperty=%u memoryPool=%u",
 +		variant, static_cast<unsigned>(custom.Type), static_cast<unsigned>(custom.CPUPageProperty),
@@ -22789,6 +23157,7 @@ index 0000000..88ed6c7
 +
 +	const D3D12_RESOURCE_DESC textureDesc = TextureDesc();
 +	const D3D12_RESOURCE_DESC bufferDesc = BufferDesc(kNeighbourBytes);
++	Call("GetResourceAllocationInfo");
 +	const D3D12_RESOURCE_ALLOCATION_INFO textureInfo = device_->GetResourceAllocationInfo(0, 1, &textureDesc);
 +	Log("REPRO_ALLOC variant=%s textureSizeInBytes=%llu textureAlignment=%llu", variant, textureInfo.SizeInBytes, textureInfo.Alignment);
 +	if (textureInfo.SizeInBytes == UINT64_MAX || textureInfo.SizeInBytes % 65536 != 0)
@@ -22806,9 +23175,21 @@ index 0000000..88ed6c7
 +	heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
 +	ComPtr<ID3D12Heap> heap;
 +	ComPtr<ID3D12Resource> neighbour;
++	{
++		char heapText[128];
++		HeapText(heapDesc.Properties, heapText);
++		CallF("CreateHeap", "variant=custom size=%llu %s alignment=%llu flags=0x%x", heapDesc.SizeInBytes, heapText,
++			heapDesc.Alignment, static_cast<unsigned>(heapDesc.Flags));
++	}
 +	if (!Api(device_->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "CreateHeap(custom)"))
 +		return;
 +	Keep(heap);
++	{
++		char descText[192];
++		DescText(bufferDesc, descText);
++		CallF("CreatePlacedResource", "variant=custom what=neighbour-buffer heapOffset=%llu %s state=0x%x", neighbourOffset, descText,
++			static_cast<unsigned>(D3D12_RESOURCE_STATE_GENERIC_READ));
++	}
 +	if (!Api(device_->CreatePlacedResource(heap.Get(), neighbourOffset, &bufferDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
 +				 IID_PPV_ARGS(&neighbour)),
 +			"CreatePlacedResource(buffer)"))
@@ -22818,6 +23199,7 @@ index 0000000..88ed6c7
 +		variant, heapDesc.SizeInBytes, textureInfo.SizeInBytes, neighbourOffset, neighbourOffset + kNeighbourBytes);
 +
 +	void* mapped = nullptr;
++	Call("Resource.Map");
 +	if (!Api(neighbour->Map(0, nullptr, &mapped), "Resource.Map(buffer)") || !mapped)
 +		return;
 +	volatile UINT* words = static_cast<volatile UINT*>(mapped);
@@ -22844,13 +23226,21 @@ index 0000000..88ed6c7
 +	Report(variant, "buffer_filled", observe());
 +
 +	// CreatePlacedResource is followed by the read with nothing in between: the log call
-+	// comes after the observation, so no other API call can be blamed for a change.
++	// comes after the observation, so no other API call can be blamed for a change. (The breadcrumb
++	// is logged before the call.)
 +	ComPtr<ID3D12Resource> texture;
++	{
++		char descText[192];
++		DescText(textureDesc, descText);
++		CallF("CreatePlacedResource", "variant=custom what=texture heapOffset=0 %s state=0x%x", descText,
++			static_cast<unsigned>(D3D12_RESOURCE_STATE_COMMON));
++	}
 +	const HRESULT createHr = device_->CreatePlacedResource(heap.Get(), 0, &textureDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
 +		IID_PPV_ARGS(&texture));
 +	const Observation afterCreate = observe();
 +	if (!Api(createHr, "CreatePlacedResource(texture)"))
 +	{
++		Call("Resource.Unmap");
 +		neighbour->Unmap(0, nullptr);
 +		return;
 +	}
@@ -22877,7 +23267,10 @@ index 0000000..88ed6c7
 +		Report(variant, step.name, observe());
 +	}
 +	if (!fatal_)
++	{
++		Call("Resource.Unmap");
 +		neighbour->Unmap(0, nullptr);
++	}
 +}
 +
 +// Copies the neighbour's first 16 bytes to the READBACK buffer and reads them on the CPU.
@@ -22885,16 +23278,19 @@ index 0000000..88ed6c7
 +{
 +	if (!BeginList())
 +		return false;
++	CallF("CopyBufferRegion", "bytes=%u", kReadbackBytes);
 +	list_->CopyBufferRegion(readback, 0, neighbour, 0, kReadbackBytes);
 +	if (!ExecuteAndWait())
 +		return false;
 +	void* mapped = nullptr;
 +	const D3D12_RANGE readRange = {0, kReadbackBytes};
++	Call("Resource.Map");
 +	if (!Api(readback->Map(0, &readRange, &mapped), "Resource.Map(readback)") || !mapped)
 +		return false;
 +	UINT values[kReadbackWords];
 +	std::memcpy(values, mapped, sizeof(values));
 +	const D3D12_RANGE wroteNothing = {0, 0};
++	Call("Resource.Unmap");
 +	readback->Unmap(0, &wroteNothing);
 +	seen = Observation();
 +	seen.word0 = values[0];
@@ -22921,6 +23317,7 @@ index 0000000..88ed6c7
 +	}
 +	const D3D12_RESOURCE_DESC textureDesc = TextureDesc();
 +	const D3D12_RESOURCE_DESC bufferDesc = BufferDesc(kNeighbourBytes);
++	Call("GetResourceAllocationInfo");
 +	const D3D12_RESOURCE_ALLOCATION_INFO textureInfo = device_->GetResourceAllocationInfo(0, 1, &textureDesc);
 +	Log("REPRO_ALLOC variant=%s textureSizeInBytes=%llu textureAlignment=%llu", variant, textureInfo.SizeInBytes, textureInfo.Alignment);
 +	if (textureInfo.SizeInBytes == UINT64_MAX || textureInfo.SizeInBytes % 65536 != 0)
@@ -22937,9 +23334,21 @@ index 0000000..88ed6c7
 +	heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
 +	ComPtr<ID3D12Heap> heap;
 +	ComPtr<ID3D12Resource> neighbour;
++	{
++		char heapText[128];
++		HeapText(heapDesc.Properties, heapText);
++		CallF("CreateHeap", "variant=default size=%llu %s alignment=%llu flags=0x%x", heapDesc.SizeInBytes, heapText,
++			heapDesc.Alignment, static_cast<unsigned>(heapDesc.Flags));
++	}
 +	if (!Api(device_->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "CreateHeap(default)"))
 +		return;
 +	Keep(heap);
++	{
++		char descText[192];
++		DescText(bufferDesc, descText);
++		CallF("CreatePlacedResource", "variant=default what=neighbour-buffer heapOffset=%llu %s state=0x%x", neighbourOffset, descText,
++			static_cast<unsigned>(D3D12_RESOURCE_STATE_COPY_DEST));
++	}
 +	if (!Api(device_->CreatePlacedResource(heap.Get(), neighbourOffset, &bufferDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
 +				 IID_PPV_ARGS(&neighbour)),
 +			"CreatePlacedResource(buffer)"))
@@ -22954,17 +23363,20 @@ index 0000000..88ed6c7
 +		return;
 +	void* mapped = nullptr;
 +	const D3D12_RANGE noRead = {0, 0};
++	Call("Resource.Map");
 +	if (!Api(upload->Map(0, &noRead, &mapped), "Resource.Map(upload)") || !mapped)
 +		return;
 +	UINT* words = static_cast<UINT*>(mapped);
 +	for (UINT i = 0; i < kNeighbourWords; ++i)
 +		words[i] = PatternWord(i);
++	Call("Resource.Unmap");
 +	upload->Unmap(0, nullptr);
 +
 +	// Fill the neighbour from the upload buffer. It then stays in COPY_SOURCE, so every
 +	// later check only needs a copy from it and no barrier on the neighbour.
 +	if (!BeginList())
 +		return;
++	CallF("CopyBufferRegion", "bytes=%u", kNeighbourBytes);
 +	list_->CopyBufferRegion(neighbour.Get(), 0, upload.Get(), 0, kNeighbourBytes);
 +	Transition(neighbour.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
 +	if (!ExecuteAndWait())
@@ -22976,6 +23388,12 @@ index 0000000..88ed6c7
 +	Report(variant, "buffer_filled", seen);
 +
 +	ComPtr<ID3D12Resource> texture;
++	{
++		char descText[192];
++		DescText(textureDesc, descText);
++		CallF("CreatePlacedResource", "variant=default what=texture heapOffset=0 %s state=0x%x", descText,
++			static_cast<unsigned>(D3D12_RESOURCE_STATE_COMMON));
++	}
 +	if (!Api(device_->CreatePlacedResource(heap.Get(), 0, &textureDesc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&texture)),
 +			"CreatePlacedResource(texture)"))
 +		return;
@@ -23017,6 +23435,279 @@ index 0000000..88ed6c7
 +	Log("REPRO_SUMMARY failures=%d", failures_);
 +	return failures_;
 +}
++// ---------------------------------------------------------------------------------------------
++// First-use probes. The failing Xbox run died between REPRO_ALLOC and REPRO_LAYOUT, i.e. inside the
++// first CreateHeap(CUSTOM) or CreatePlacedResource(buffer) on a device that had not touched anything
++// else. Each probe creates its own brand-new device and tests one hypothesis for that:
++//   P1  CreateHeap(CUSTOM from GetCustomHeapProperties(UPLOAD), 327680 bytes) is the first API use after
++//       device and queue creation, then a 64 KB placed buffer at 262144, Map, write and read one word.
++//   P2  as P1, after an empty command list was submitted and waited for.
++//   P3  as P1, after a DEFAULT heap of 64 KB was created.
++//   P4  a committed 64 KB buffer in the CUSTOM WRITE_BACK/L0 properties instead of a heap, Map, write/read.
++//   P5  as P1, but the heap properties are built by hand with node masks 0/0 instead of the query's 1/1.
++// Nothing here configures DRED or the debug layer. Every step logs
++//   PROBE id=<P1..P5> step=<step> result=ok|FAIL hr=0x<hr>
++// and the probe ends with PROBE_END id=<id> completed=0|1.
++// ---------------------------------------------------------------------------------------------
++constexpr UINT kProbeHeapBytes = 327680;
++constexpr U64 kProbeBufferOffset = 262144;
++
++class Probe : public Out
++{
++public:
++	Probe(unsigned id, LogSink sink, void* user, bool warp, ProbeStatus* status)
++		: Out(sink, user, StageName(id)), id_(id), warp_(warp), status_(status) {}
++	~Probe()
++	{
++		if (event_)
++			CloseHandle(event_);
++	}
++
++	void Run();
++	// True when the device failed or a GPU wait timed out; the caller must then leak this object.
++	bool Fatal() const { return fatal_; }
++
++private:
++	static const char* StageName(unsigned id)
++	{
++		static const char* const names[] = {"P0", "P1", "P2", "P3", "P4", "P5"};
++		return id < 6 ? names[id] : "P?";
++	}
++	static const char* Description(unsigned id)
++	{
++		switch (id)
++		{
++		case 1: return "first-use-custom-heap";
++		case 2: return "after-empty-submit";
++		case 3: return "after-default-heap";
++		case 4: return "committed-custom-buffer";
++		case 5: return "hand-built-node-masks-0";
++		default: return "unknown";
++		}
++	}
++	bool Step(const char* step, HRESULT hr);
++	bool EmptySubmit();
++	bool MapAndCheck(ID3D12Resource* buffer);
++	void Execute();
++
++	unsigned id_;
++	bool warp_;
++	ProbeStatus* status_;
++	bool fatal_ = false;
++	bool completed_ = false;
++
++	ComPtr<IDXGIFactory4> factory_;
++	ComPtr<IDXGIAdapter1> adapter_;
++	ComPtr<ID3D12Device> device_;
++	ComPtr<ID3D12CommandQueue> queue_;
++	ComPtr<ID3D12CommandAllocator> allocator_;
++	ComPtr<ID3D12GraphicsCommandList> list_;
++	ComPtr<ID3D12Fence> fence_;
++	HANDLE event_ = nullptr;
++	D3D12_HEAP_PROPERTIES heapProperties_ = {};
++	ComPtr<ID3D12Heap> defaultHeap_;
++	ComPtr<ID3D12Heap> heap_;
++	ComPtr<ID3D12Resource> buffer_;
++};
++
++// Logs the step; on failure also checks for device removal.
++bool Probe::Step(const char* step, HRESULT hr)
++{
++	const bool ok = SUCCEEDED(hr);
++	Log("PROBE id=%s step=%s result=%s hr=0x%08lx", stage_, step, ok ? "ok" : "FAIL", static_cast<unsigned long>(hr));
++	if (ok)
++		return true;
++	if (device_)
++	{
++		Call("GetDeviceRemovedReason");
++		const HRESULT removed = device_->GetDeviceRemovedReason();
++		if (FAILED(removed))
++		{
++			Log("PROBE_DEVICE_REMOVED id=%s reason=0x%08lx", stage_, static_cast<unsigned long>(removed));
++			fatal_ = true;
++			if (status_)
++				status_->deviceFailed = true;
++		}
++	}
++	return false;
++}
++
++// Submits an empty command list and waits for its fence.
++bool Probe::EmptySubmit()
++{
++	const D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++	Call("CreateCommandAllocator");
++	if (!Step("create-allocator", device_->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator_))))
++		return false;
++	Call("CreateCommandList");
++	if (!Step("create-list", device_->CreateCommandList(0, type, allocator_.Get(), nullptr, IID_PPV_ARGS(&list_))))
++		return false;
++	Call("CommandList.Close");
++	if (!Step("close-list", list_->Close()))
++		return false;
++	Call("CreateFence");
++	if (!Step("create-fence", device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_))))
++		return false;
++	Call("CreateEventExW");
++	event_ = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
++	if (!Step("create-event", event_ ? S_OK : HRESULT_FROM_WIN32(GetLastError())))
++		return false;
++	ID3D12CommandList* lists[] = {list_.Get()};
++	Call("ExecuteCommandLists");
++	queue_->ExecuteCommandLists(1, lists);
++	Call("Queue.Signal");
++	if (!Step("signal", queue_->Signal(fence_.Get(), 1)))
++		return false;
++	Call("Fence.GetCompletedValue");
++	if (fence_->GetCompletedValue() < 1)
++	{
++		Call("Fence.SetEventOnCompletion");
++		if (!Step("set-event", fence_->SetEventOnCompletion(1, event_)))
++			return false;
++		CallF("WaitForSingleObjectEx", "fence=1 timeoutMs=%lu", static_cast<unsigned long>(kWaitMilliseconds));
++		if (WaitForSingleObjectEx(event_, kWaitMilliseconds, FALSE) != WAIT_OBJECT_0)
++		{
++			Log("PROBE_FATAL_WAIT id=%s fence=1 timeoutMs=%lu", stage_, static_cast<unsigned long>(kWaitMilliseconds));
++			fatal_ = true;
++			if (status_)
++				status_->deviceFailed = true;
++			return Step("empty-submit", E_FAIL);
++		}
++	}
++	Call("GetDeviceRemovedReason");
++	return Step("empty-submit", device_->GetDeviceRemovedReason());
++}
++
++// Map, write one word, read it back, Unmap.
++bool Probe::MapAndCheck(ID3D12Resource* buffer)
++{
++	void* mapped = nullptr;
++	Call("Resource.Map");
++	if (!Step("map", buffer->Map(0, nullptr, &mapped)) || !mapped)
++		return false;
++	volatile UINT* words = static_cast<volatile UINT*>(mapped);
++	words[0] = PatternWord(0);
++	MemoryBarrier();
++	const bool ok = words[0] == PatternWord(0);
++	Call("Resource.Unmap");
++	buffer->Unmap(0, nullptr);
++	return Step("write-read", ok ? S_OK : E_FAIL);
++}
++
++void Probe::Execute()
++{
++	const char* failedApi = nullptr;
++	const HRESULT selectHr = SelectAdapter(*this, warp_, factory_, adapter_, &failedApi);
++	if (FAILED(selectHr))
++	{
++		Step(failedApi, selectHr);
++		if (status_)
++			status_->deviceFailed = true;
++		return;
++	}
++	if (!adapter_)
++	{
++		Log("PROBE_UNAVAILABLE id=%s reason=no-hardware-d3d12-adapter", stage_);
++		if (status_)
++			status_->unavailable = true;
++		return;
++	}
++	DXGI_ADAPTER_DESC1 adapterDesc = {};
++	Call("IDXGIAdapter1.GetDesc1");
++	adapter_->GetDesc1(&adapterDesc);
++	char name[256] = {};
++	WideCharToMultiByte(CP_UTF8, 0, adapterDesc.Description, -1, name, sizeof(name), nullptr, nullptr);
++	Log("PROBE_ADAPTER id=%s description=%s vendor=0x%04x device=0x%04x warp=%u", stage_, name, adapterDesc.VendorId,
++		adapterDesc.DeviceId, warp_ ? 1u : 0u);
++
++	CallF("D3D12CreateDevice", "featureLevel=0x%x", static_cast<unsigned>(D3D_FEATURE_LEVEL_11_0));
++	if (!Step("create-device", D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_))))
++	{
++		if (status_)
++			status_->deviceFailed = true;
++		return;
++	}
++	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
++	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++	Call("CreateCommandQueue");
++	if (!Step("create-queue", device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_))))
++		return;
++
++	if (id_ == 2 && !EmptySubmit())
++		return;
++	if (id_ == 3)
++	{
++		D3D12_HEAP_DESC heapDesc = {};
++		heapDesc.SizeInBytes = 65536;
++		heapDesc.Properties = StandardHeap(D3D12_HEAP_TYPE_DEFAULT);
++		heapDesc.Alignment = 65536;
++		heapDesc.Flags = D3D12_HEAP_FLAG_NONE;
++		char heapText[128];
++		HeapText(heapDesc.Properties, heapText);
++		CallF("CreateHeap", "what=default-heap size=%llu %s alignment=%llu flags=0x%x", heapDesc.SizeInBytes, heapText,
++			heapDesc.Alignment, static_cast<unsigned>(heapDesc.Flags));
++		if (!Step("create-default-heap", device_->CreateHeap(&heapDesc, IID_PPV_ARGS(&defaultHeap_))))
++			return;
++	}
++
++	const D3D12_RESOURCE_DESC bufferDesc = BufferDesc(kNeighbourBytes);
++	char descText[192];
++	DescText(bufferDesc, descText);
++	if (id_ == 5)
++	{
++		D3D12_HEAP_PROPERTIES custom = {};
++		custom.Type = D3D12_HEAP_TYPE_CUSTOM;
++		custom.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
++		custom.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
++		custom.CreationNodeMask = 0;
++		custom.VisibleNodeMask = 0;
++		heapProperties_ = custom;
++		Log("PROBE_HEAP id=%s source=hand-built", stage_);
++	}
++	else
++	{
++		Call("GetCustomHeapProperties");
++		heapProperties_ = device_->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_UPLOAD);
++		Log("PROBE_HEAP id=%s source=GetCustomHeapProperties(UPLOAD)", stage_);
++	}
++	char heapText[128];
++	HeapText(heapProperties_, heapText);
++
++	if (id_ == 4)
++	{
++		CallF("CreateCommittedResource", "%s heapFlags=0x0 %s state=0x%x", heapText, descText, static_cast<unsigned>(D3D12_RESOURCE_STATE_GENERIC_READ));
++		if (!Step("create-committed-buffer", device_->CreateCommittedResource(&heapProperties_, D3D12_HEAP_FLAG_NONE, &bufferDesc,
++				D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer_))))
++			return;
++	}
++	else
++	{
++		D3D12_HEAP_DESC heapDesc = {};
++		heapDesc.SizeInBytes = kProbeHeapBytes;
++		heapDesc.Properties = heapProperties_;
++		heapDesc.Alignment = 65536;
++		heapDesc.Flags = D3D12_HEAP_FLAG_NONE;
++		CallF("CreateHeap", "what=custom-heap size=%llu %s alignment=%llu flags=0x%x", heapDesc.SizeInBytes, heapText,
++			heapDesc.Alignment, static_cast<unsigned>(heapDesc.Flags));
++		if (!Step("create-heap", device_->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap_))))
++			return;
++		CallF("CreatePlacedResource", "what=buffer heapOffset=%llu %s state=0x%x", kProbeBufferOffset, descText,
++			static_cast<unsigned>(D3D12_RESOURCE_STATE_GENERIC_READ));
++		if (!Step("create-placed-buffer", device_->CreatePlacedResource(heap_.Get(), kProbeBufferOffset, &bufferDesc,
++				D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer_))))
++			return;
++	}
++	completed_ = MapAndCheck(buffer_.Get());
++}
++
++void Probe::Run()
++{
++	Log("PROBE_BEGIN id=%s variant=%s warp=%u", stage_, Description(id_), warp_ ? 1u : 0u);
++	Execute();
++	if (status_)
++		status_->completed = completed_;
++	Log("PROBE_END id=%s completed=%u", stage_, completed_ ? 1u : 0u);
++}
 +} // namespace
 +
 +int RunMinimalRepro(LogSink sink, void* user, bool warp, ReproStatus* status)
@@ -23028,6 +23719,15 @@ index 0000000..88ed6c7
 +	if (!repro->Fatal())
 +		delete repro;
 +	return failures;
++}
++
++void RunFirstUseProbe(unsigned id, LogSink sink, void* user, bool warp, ProbeStatus* status)
++{
++	// A probe that failed fatally (device removed, GPU wait timed out) is leaked on purpose.
++	Probe* probe = new Probe(id, sink, user, warp, status);
++	probe->Run();
++	if (!probe->Fatal())
++		delete probe;
 +}
 +} // namespace rrdiag
 diff --git a/src/hardware/r_d3d12/isolation/observe.hlsl b/src/hardware/r_d3d12/isolation/observe.hlsl

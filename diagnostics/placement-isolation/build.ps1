@@ -148,6 +148,36 @@ function Get-Fields([string]$Line) {
     return $Fields
 }
 
+# Every stage ran and completed, no crash was captured, the watchdog stayed silent, and each first-use probe finished.
+function Assert-Supervision([string]$Name, [string[]]$Lines) {
+    if (@($Lines | Where-Object { $_ -match '^(SEH|WATCHDOG) ' }).Count) { throw "$Name logged an SEH exception or a WATCHDOG report." }
+    $Stages = 'P1', 'P2', 'P3', 'P4', 'P5', 'A', 'B', 'C', 'D'
+    foreach ($Stage in $Stages) {
+        $Begins = @($Lines | Where-Object { $_ -ceq "STAGE_BEGIN stage=$Stage" })
+        $Ends = @($Lines | Where-Object { $_ -match "^STAGE_END stage=$Stage result=" })
+        if ($Begins.Count -ne 1 -or $Ends.Count -ne 1 -or $Ends[0] -cne "STAGE_END stage=$Stage result=completed") {
+            throw "$Name stage $Stage did not begin once and end with result=completed: $($Ends -join ' | ')"
+        }
+    }
+    if (@($Lines | Where-Object { $_ -match '^STAGE_END ' }).Count -ne $Stages.Count) { throw "$Name logged an unexpected number of stages." }
+    foreach ($Probe in 'P1', 'P2', 'P3', 'P4', 'P5') {
+        $ProbeEnds = @($Lines | Where-Object { $_ -match "^PROBE_END id=$Probe completed=" })
+        if ($ProbeEnds.Count -ne 1) { throw "$Name probe $Probe has no unique PROBE_END." }
+        if ($ProbeEnds[0] -ceq "PROBE_END id=$Probe completed=1") { continue }
+        # WARP may refuse P5's hand-built heap properties; then CreateHeap, and only CreateHeap, may fail.
+        $Failed = @($Lines | Where-Object { $_ -match "^PROBE id=$Probe step=\S+ result=FAIL " })
+        if ($Probe -cne 'P5' -or $Failed.Count -ne 1 -or $Failed[0] -notmatch '^PROBE id=P5 step=create-heap result=FAIL hr=0x[0-9a-f]{8}$') {
+            throw "$Name probe $Probe did not complete: $($Failed -join ' | ')"
+        }
+        Write-Host "$Name probe P5: WARP refused CreateHeap with hand-built node masks 0 ($($Failed[0]))."
+    }
+}
+
+function Find-LineIndex([string[]]$Lines, [string]$Pattern, [int]$Start = 0) {
+    for ($Index = $Start; $Index -lt $Lines.Count; $Index++) { if ($Lines[$Index] -match $Pattern) { return $Index } }
+    return -1
+}
+
 # Runs the default suite and checks that the log is complete and self-consistent.
 function RunDefaultProbe([string]$Name, [string[]]$Arguments, [int]$ExpectedExit) {
     $Log = Join-Path $Logs "$Name.txt"
@@ -164,7 +194,8 @@ function RunDefaultProbe([string]$Name, [string[]]$Arguments, [int]$ExpectedExit
     $Counts = Get-Fields $Summaries[0]
     $HostFields = Get-Fields $Results[0]
     foreach ($Key in 'reproFailures', 'mapCasesWithOutsideWrites', 'unavailable', 'committedCpuChanged', 'copyOrderFailures', 'selfTestsFailed',
-                     'deviceFailed', 'mapCasesRun', 'committedDefaultChanged', 'uploadSourceDamaged', 'injectionsAttempted', 'injectionsDetected', 'debugErrors') {
+                     'deviceFailed', 'mapCasesRun', 'committedDefaultChanged', 'uploadSourceDamaged', 'injectionsAttempted', 'injectionsDetected', 'debugErrors',
+                     'sehStages', 'stagesIncomplete', 'probesCompleted', 'watchdogReports') {
         if (-not $Counts.ContainsKey($Key) -or $Counts[$Key] -cne $HostFields[$Key]) { throw "$Name core/host summaries disagree on $Key." }
     }
     if ($Counts['reproFailures'] -cne (Get-Fields $ReproSummaries[0])['failures']) { throw "$Name repro summary disagrees with MAP_SUMMARY." }
@@ -172,9 +203,10 @@ function RunDefaultProbe([string]$Name, [string[]]$Arguments, [int]$ExpectedExit
     if (@($Lines | Where-Object { $_ -match '^(API_FAILURE|REPRO_API_FAILURE|REPRO_FATAL_WAIT|FATAL_WAIT|DEVICE_REMOVED|REPRO_DEVICE_REMOVED|SELF_TEST_FAIL) ' }).Count) {
         throw "$Name logged an API, device or self-test failure."
     }
-    if (-not ($Lines | Where-Object { $_ -match 'SETTINGS debugRequested=1 debugApplied=1 gbvRequested=1 gbvApplied=1 dredRequested=0 dredApplied=1 configuredBeforeDevice=1' })) {
-        throw "$Name did not actually enable the SDK debug layer and GPU validation with DRED forced off."
+    if (-not ($Lines | Where-Object { $_ -match 'SETTINGS debugRequested=1 debugApplied=1 gbvRequested=1 gbvApplied=1 dredRequested=0 dredApplied=0 configuredBeforeDevice=1 dredUntouched=1' })) {
+        throw "$Name did not enable the SDK debug layer and GPU validation, or touched the DRED settings (the default path must leave them alone)."
     }
+    Assert-Supervision $Name $Lines
     return ,$Lines
 }
 
@@ -216,11 +248,52 @@ function VerifyDefaultHealthy([string]$Name, [string[]]$Lines) {
     foreach ($Variant in 'D1', 'D2', 'D3', 'D4') {
         if (-not ($Lines | Where-Object { $_ -ceq "COPY_ORDER_SUMMARY variant=$Variant failures=0/20" })) { throw "$Name copy-order variant $Variant did not pass 20/20." }
     }
+    # P1: after queue creation the very next API calls are the custom-heap query and CreateHeap, then the buffer.
+    $Queue = Find-LineIndex $Lines '^PROBE id=P1 step=create-queue result=ok '
+    if ($Queue -lt 0 -or $Lines[$Queue + 1] -cne 'CALL stage=P1 api=GetCustomHeapProperties' -or $Lines[$Queue + 2] -cnotmatch '^PROBE_HEAP id=P1 ' -or
+        $Lines[$Queue + 3] -cnotmatch '^CALL stage=P1 api=CreateHeap what=custom-heap size=327680 type=4 .* alignment=65536 flags=0x0$' -or
+        $Lines[$Queue + 4] -cnotmatch '^PROBE id=P1 step=create-heap ') {
+        throw "$Name probe P1 is not 'create queue, then CreateHeap(CUSTOM, 327680) as the first use'."
+    }
+    # Nothing is logged between CreatePlacedResource(test texture) and the observation that follows it.
+    for ($Index = 0; $Index -lt $Lines.Count - 1; $Index++) {
+        if ($Lines[$Index] -match '^CALL stage=B api=CreatePlacedResource what=texture id=([0-9]+) ') {
+            $CaseId = $Matches[1]
+            if ($Lines[$Index + 1] -cnotmatch "^MAP_STEP id=$CaseId step=create ") { throw "$Name logged between CreatePlacedResource(texture) and its snapshot in map case ${CaseId}: $($Lines[$Index + 1])" }
+        }
+        elseif ($Lines[$Index] -match '^CALL stage=A api=CreatePlacedResource variant=custom what=texture ') {
+            if ($Lines[$Index + 1] -cnotmatch '^REPRO variant=custom step=create_texture ') { throw "$Name logged between the repro's CreatePlacedResource(texture) and its observation: $($Lines[$Index + 1])" }
+        }
+    }
+    foreach ($Stage in 'A', 'B', 'C', 'D') {
+        if (-not ($Lines | Where-Object { $_ -match "^CALL stage=$Stage api=" })) { throw "$Name has no CALL breadcrumbs for stage $Stage." }
+    }
     Write-Host "Verified ${Name}: minimal repro, $($Counts['mapCasesRun']) map cases with no writes outside the textures, committed CPU/default controls and four copy-order variants."
 }
 
 $Lines = RunDefaultProbe 'warp-default' @('--warp', '--debug', '--gpu-validation') 0
 VerifyDefaultHealthy 'warp-default' $Lines
+
+# SEH self-test: a test-only first stage writes to nullptr; the guard must log the exception and every
+# following stage must still run to completion on its own device.
+$Name = 'self-test-seh'
+$Log = Join-Path $Logs "$Name.txt"
+Write-Host "Running $Name; complete observations: $Log"
+& $Console @('--warp', '--quick', '--self-test-seh') *> $Log
+if ($LASTEXITCODE -ne 0) { throw "$Name failed: exit $LASTEXITCODE; see $Log" }
+$Lines = @(Get-Content $Log)
+$SehLines = @($Lines | Where-Object { $_ -match '^SEH ' })
+if ($SehLines.Count -ne 1 -or $SehLines[0] -cnotmatch '^SEH stage=self-test code=0xc0000005 address=0x[0-9a-f]+ module=placement-isolation\.exe offset=0x[0-9a-f]+ handler=stage-guard thread=[0-9]+$') {
+    throw "$Name did not log exactly one access violation in the self-test stage: $($SehLines -join ' | ')"
+}
+Write-Host $SehLines[0]
+if (-not ($Lines | Where-Object { $_ -ceq 'STAGE_END stage=self-test result=seh' })) { throw "$Name self-test stage did not end with result=seh." }
+if (@($Lines | Where-Object { $_ -match '^WATCHDOG ' }).Count) { throw "$Name logged a WATCHDOG report." }
+foreach ($Stage in 'P1', 'P2', 'P3', 'P4', 'P5', 'A', 'B', 'C', 'D') {
+    if (-not ($Lines | Where-Object { $_ -ceq "STAGE_END stage=$Stage result=completed" })) { throw "$Name stage $Stage did not complete after the SEH exception." }
+}
+if (-not ($Lines | Where-Object { $_ -match '^HOST_RESULT .* sehStages=1 stagesIncomplete=1 ' })) { throw "$Name host result does not report exactly one crashed stage." }
+Write-Host "Verified ${Name}: access violation captured in stage self-test, all nine later stages completed."
 
 # Injection self-test: the harness itself clears one DWORD just past each texture; the map
 # suite must report exactly that DWORD, once, at the right offset, and nothing else.

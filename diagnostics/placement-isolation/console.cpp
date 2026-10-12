@@ -70,8 +70,9 @@ int main(int argc, char** argv)
 		else if (!std::strcmp(argv[i], "--quick")) options.quick = true;
 		else if (!std::strcmp(argv[i], "--debug")) options.debug = true;
 		else if (!std::strcmp(argv[i], "--gpu-validation")) options.gpuValidation = true;
-		else if (!std::strcmp(argv[i], "--dred-on")) options.dredEnabled = true;
-		else if (!std::strcmp(argv[i], "--dred-off")) options.dredEnabled = false;
+		else if (!std::strcmp(argv[i], "--dred-on")) { options.dredEnabled = true; options.dredExplicit = true; }
+		else if (!std::strcmp(argv[i], "--dred-off")) { options.dredEnabled = false; options.dredExplicit = true; }
+		else if (!std::strcmp(argv[i], "--self-test-seh")) options.selfTestSeh = true;
 		else if (!std::strcmp(argv[i], "--legacy-suite")) options.legacySuite = true;
 		else if (!std::strcmp(argv[i], "--repro-only")) reproOnly = true;
 		else if (!std::strcmp(argv[i], "--negative-map-outside")) options.injection = rrdiag::Injection::MapOutsideWord;
@@ -114,11 +115,13 @@ int main(int argc, char** argv)
 			result.copyOrderFailures[2] + result.copyOrderFailures[3];
 		std::printf("HOST_RESULT reproFailures=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u "
 			"copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u deviceFailed=%u mapCasesRun=%u committedDefaultChanged=%u "
-			"uploadSourceDamaged=%u injectionsAttempted=%u injectionsDetected=%u debugErrors=%u\n",
+			"uploadSourceDamaged=%u injectionsAttempted=%u injectionsDetected=%u debugErrors=%u "
+			"sehStages=%u stagesIncomplete=%u probesCompleted=%u watchdogReports=%u\n",
 			result.reproFailures, result.mapCasesWithOutsideWrites, result.unavailableCases, result.committedCpuChanged,
 			result.copyOrderFailures[0], result.copyOrderFailures[1], result.copyOrderFailures[2], result.copyOrderFailures[3],
 			result.selfTestsFailed, result.deviceFailed ? 1 : 0, result.mapCasesRun, result.committedDefaultChanged,
-			result.uploadSourceDamaged, result.injectionsAttempted, result.injectionsDetected, result.debugErrors ? 1 : 0);
+			result.uploadSourceDamaged, result.injectionsAttempted, result.injectionsDetected, result.debugErrors ? 1 : 0,
+			result.sehStages, result.stagesIncomplete, result.probesCompleted, result.watchdogReports);
 		const bool clean = !result.deviceFailed && !result.debugErrors && !result.selfTestsFailed;
 		if (options.injection == rrdiag::Injection::MapOutsideWord)
 		{
@@ -133,8 +136,13 @@ int main(int argc, char** argv)
 			std::puts("NEGATIVE_ORACLE_INVALID");
 			return 3;
 		}
+		if (options.selfTestSeh)
+		{
+			// The self-test stage must be the only stage that ended in an SEH exception; every other stage ran.
+			return clean && result.sehStages == 1 && result.stagesIncomplete == 1 && result.mapCasesRun && !result.watchdogReports ? 0 : 1;
+		}
 		// Hardware runs are expected to report the driver defect; WARP must be clean.
-		return clean && result.mapCasesRun && !result.reproFailures && !result.mapCasesWithOutsideWrites &&
+		return clean && !result.sehStages && !result.watchdogReports && result.mapCasesRun && !result.reproFailures && !result.mapCasesWithOutsideWrites &&
 			!result.committedCpuChanged && !result.committedDefaultChanged && !result.uploadSourceDamaged && !copyFailures ? 0 : 1;
 	}
 	std::printf("HOST_RESULT cases=%u mismatches=%u unavailable=%u selfTestsFailed=%u deviceFailed=%u debugErrors=%u\n",

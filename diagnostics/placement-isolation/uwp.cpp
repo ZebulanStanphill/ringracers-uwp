@@ -112,10 +112,10 @@ private:
 			Utf8(AnalyticsInfo::VersionInfo->DeviceFamily).c_str(), Utf8(AnalyticsInfo::VersionInfo->DeviceFamilyVersion).c_str(),
 			(osVersion >> 48) & 0xffff, (osVersion >> 32) & 0xffff, (osVersion >> 16) & 0xffff, osVersion & 0xffff);
 		Log(nullptr, metadata);
-		Log(nullptr, "HOST log=LocalState/placement-isolation-log.txt automatic=1 suite=minimal-repro,map,committed-cpu,copy-order dred=off passes=1");
+		Log(nullptr, "HOST log=LocalState/placement-isolation-log.txt automatic=1 suite=first-use-probes,minimal-repro,map,committed-cpu,copy-order dred=untouched passes=1");
 
 		auto dialog = ref new MessageDialog(
-			"The D3D12 memory isolation tests (minimal repro, memory map, committed texture and copy-order tests) are running automatically in one pass. Leave this app open until the completion message appears. "
+			"The D3D12 memory isolation tests (first-use probes, minimal repro, memory map, committed texture and copy-order tests) are running automatically in one pass. Leave this app open until the completion message appears. If the app closes by itself, or this message stays up for more than a few minutes, note which happened. "
 			"Results are written to placement-isolation-log.txt in this app's LocalState folder.",
 			"D3D12 isolation test running");
 		auto dispatcher = window_->Dispatcher;
@@ -143,14 +143,14 @@ private:
 			{
 				if (!state.closing && SUCCEEDED(apartment.result))
 				{
-					// One pass: the minimal repro on its own device first, then the map,
-					// committed-texture and copy-order tests on a second device. DRED is off.
+					// One pass: first-use probes and the minimal repro, each on its own device, then the map,
+					// committed-texture and copy-order tests. DRED settings are left untouched. Every stage logs
+					// CALL breadcrumbs and runs behind the core's SEH guard and watchdog.
 					state.mode = "default";
 					rrdiag::Options options;
-					options.dredEnabled = false;
 					result = rrdiag::Run(options, Log, nullptr);
 					ran = true;
-					failed |= result.deviceFailed || result.debugErrors;
+					failed |= result.deviceFailed || result.debugErrors || result.sehStages;
 					if (result.deviceFailed)
 						Log(nullptr, "HOST_STOP deviceFailure=1 restartRequired=1");
 				}
@@ -173,9 +173,9 @@ private:
 				result.copyOrderFailures[2] + result.copyOrderFailures[3];
 			const bool detected = result.reproFailures || result.mapCasesWithOutsideWrites || result.committedCpuChanged ||
 				result.committedDefaultChanged || result.uploadSourceDamaged || copyFailures;
-			char summary[768];
-			std::snprintf(summary, sizeof(summary), "HOST_FINISHED ran=%u reproFailures=%u mapCasesRun=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u committedDefaultChanged=%u copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u failed=%u closed=%u wallSeconds=%.3f cpuSeconds=%.3f",
-				ran ? 1u : 0u, result.reproFailures, result.mapCasesRun, result.mapCasesWithOutsideWrites, result.unavailableCases,
+			char summary[896];
+			std::snprintf(summary, sizeof(summary), "HOST_FINISHED ran=%u sehStages=%u stagesIncomplete=%u probesCompleted=%u watchdogReports=%u reproFailures=%u mapCasesRun=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u committedDefaultChanged=%u copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u failed=%u closed=%u wallSeconds=%.3f cpuSeconds=%.3f",
+				ran ? 1u : 0u, result.sehStages, result.stagesIncomplete, result.probesCompleted, result.watchdogReports, result.reproFailures, result.mapCasesRun, result.mapCasesWithOutsideWrites, result.unavailableCases,
 				result.committedCpuChanged, result.committedDefaultChanged, result.copyOrderFailures[0], result.copyOrderFailures[1],
 				result.copyOrderFailures[2], result.copyOrderFailures[3], result.selfTestsFailed, failed ? 1 : 0, state.closing ? 1 : 0, elapsed, cpu);
 			Log(nullptr, summary);
@@ -183,7 +183,8 @@ private:
 			{
 				std::wstring text = (failed || result.selfTestsFailed) ? L"The tests finished with an error. " :
 					(detected ? L"The tests detected changed memory. " : L"The tests completed without detected memory changes. ");
-				text += L"Minimal repro failures: " + std::to_wstring(result.reproFailures) +
+				text += L"Stages that crashed: " + std::to_wstring(result.sehStages) + L". Probes completed: " + std::to_wstring(result.probesCompleted) + L" of 5" +
+						L". Minimal repro failures: " + std::to_wstring(result.reproFailures) +
 					L". Map cases with writes outside the texture: " + std::to_wstring(result.mapCasesWithOutsideWrites) + L" of " + std::to_wstring(result.mapCasesRun) +
 					L". Changed texels in committed CPU-visible tests: " + std::to_wstring(result.committedCpuChanged) +
 					L". Copy-order failures: " + std::to_wstring(copyFailures) +
