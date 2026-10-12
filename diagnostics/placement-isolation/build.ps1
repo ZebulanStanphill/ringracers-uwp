@@ -152,11 +152,11 @@ function Get-Fields([string]$Line) {
 function Assert-Supervision([string]$Name, [string[]]$Lines) {
     if (@($Lines | Where-Object { $_ -match '^(SEH|WATCHDOG) ' }).Count) { throw "$Name logged an SEH exception or a WATCHDOG report." }
     $Stages = 'P1', 'P2', 'P3', 'P4', 'P5', 'A', 'B', 'C', 'D'
-    foreach ($Stage in $Stages) {
-        $Begins = @($Lines | Where-Object { $_ -ceq "STAGE_BEGIN stage=$Stage" })
-        $Ends = @($Lines | Where-Object { $_ -match "^STAGE_END stage=$Stage result=" })
-        if ($Begins.Count -ne 1 -or $Ends.Count -ne 1 -or $Ends[0] -cne "STAGE_END stage=$Stage result=completed") {
-            throw "$Name stage $Stage did not begin once and end with result=completed: $($Ends -join ' | ')"
+    foreach ($StageId in $Stages) {
+        $Begins = @($Lines | Where-Object { $_ -ceq "STAGE_BEGIN stage=$StageId" })
+        $Ends = @($Lines | Where-Object { $_ -match "^STAGE_END stage=$StageId result=" })
+        if ($Begins.Count -ne 1 -or $Ends.Count -ne 1 -or $Ends[0] -cne "STAGE_END stage=$StageId result=completed") {
+            throw "$Name stage $StageId did not begin once and end with result=completed: $($Ends -join ' | ')"
         }
     }
     if (@($Lines | Where-Object { $_ -match '^STAGE_END ' }).Count -ne $Stages.Count) { throw "$Name logged an unexpected number of stages." }
@@ -265,8 +265,8 @@ function VerifyDefaultHealthy([string]$Name, [string[]]$Lines) {
             if ($Lines[$Index + 1] -cnotmatch '^REPRO variant=custom step=create_texture ') { throw "$Name logged between the repro's CreatePlacedResource(texture) and its observation: $($Lines[$Index + 1])" }
         }
     }
-    foreach ($Stage in 'A', 'B', 'C', 'D') {
-        if (-not ($Lines | Where-Object { $_ -match "^CALL stage=$Stage api=" })) { throw "$Name has no CALL breadcrumbs for stage $Stage." }
+    foreach ($StageId in 'A', 'B', 'C', 'D') {
+        if (-not ($Lines | Where-Object { $_ -match "^CALL stage=$StageId api=" })) { throw "$Name has no CALL breadcrumbs for stage $StageId." }
     }
     Write-Host "Verified ${Name}: minimal repro, $($Counts['mapCasesRun']) map cases with no writes outside the textures, committed CPU/default controls and four copy-order variants."
 }
@@ -289,8 +289,8 @@ if ($SehLines.Count -ne 1 -or $SehLines[0] -cnotmatch '^SEH stage=self-test code
 Write-Host $SehLines[0]
 if (-not ($Lines | Where-Object { $_ -ceq 'STAGE_END stage=self-test result=seh' })) { throw "$Name self-test stage did not end with result=seh." }
 if (@($Lines | Where-Object { $_ -match '^WATCHDOG ' }).Count) { throw "$Name logged a WATCHDOG report." }
-foreach ($Stage in 'P1', 'P2', 'P3', 'P4', 'P5', 'A', 'B', 'C', 'D') {
-    if (-not ($Lines | Where-Object { $_ -ceq "STAGE_END stage=$Stage result=completed" })) { throw "$Name stage $Stage did not complete after the SEH exception." }
+foreach ($StageId in 'P1', 'P2', 'P3', 'P4', 'P5', 'A', 'B', 'C', 'D') {
+    if (-not ($Lines | Where-Object { $_ -ceq "STAGE_END stage=$StageId result=completed" })) { throw "$Name stage $StageId did not complete after the SEH exception." }
 }
 if (-not ($Lines | Where-Object { $_ -match '^HOST_RESULT .* sehStages=1 stagesIncomplete=1 ' })) { throw "$Name host result does not report exactly one crashed stage." }
 Write-Host "Verified ${Name}: access violation captured in stage self-test, all nine later stages completed."
