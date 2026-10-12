@@ -1,6 +1,7 @@
 // Side-by-side Xbox diagnostic host. GPL-2.0-or-later.
 #include "isolation.h"
 #include <windows.h>
+#include <roapi.h>
 #include <cstdio>
 #include <atomic>
 #include <chrono>
@@ -35,6 +36,12 @@ struct State
 	}
 } state;
 
+struct WorkerApartment
+{
+	HRESULT result = RoInitialize(RO_INIT_MULTITHREADED);
+	~WorkerApartment() { if (SUCCEEDED(result)) RoUninitialize(); }
+};
+
 std::string Utf8(String^ value)
 {
 	const int count = WideCharToMultiByte(CP_UTF8, 0, value->Data(), value->Length(), nullptr, 0, nullptr, nullptr);
@@ -65,6 +72,8 @@ double CpuSeconds()
 }
 
 namespace RingRacersD3D12Isolation {
+// Window/dialog members are confined to the view's UI thread. Background
+// callbacks use a captured agile dispatcher to post work before accessing them.
 ref class View sealed : public IFrameworkView
 {
 private:
@@ -109,22 +118,29 @@ private:
 			"The D3D12 memory isolation tests are running automatically. Leave this app open until the completion message appears. "
 			"Results are written to placement-isolation-log.txt in this app's LocalState folder.",
 			"D3D12 isolation test running");
+		auto dispatcher = window_->Dispatcher;
 		startingDialog_ = dialog->ShowAsync();
 		startingDialog_->Completed = ref new AsyncOperationCompletedHandler<IUICommand^>(
-			[this](IAsyncOperation<IUICommand^>^, AsyncStatus) {
+			[this, dispatcher](IAsyncOperation<IUICommand^>^, AsyncStatus) {
 				if (!state.closing)
-					window_->Dispatcher->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([this] { ShowFinal(); }));
+					dispatcher->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([this] { ShowFinal(); }));
 			});
 
-		auto dispatcher = window_->Dispatcher;
 		state.worker = std::thread([this, dispatcher] {
+			WorkerApartment apartment;
 			const auto start = std::chrono::steady_clock::now();
 			const auto cpuStart = CpuSeconds();
 			unsigned cases = 0, mismatches = 0, unavailable = 0, selfTestsFailed = 0;
-			bool failed = false;
+			bool failed = FAILED(apartment.result);
+			if (failed)
+			{
+				char error[128];
+				std::snprintf(error, sizeof(error), "HOST_WORKER_INIT_FAILED hr=0x%08lx testsSkipped=1", static_cast<unsigned long>(apartment.result));
+				Log(nullptr, error);
+			}
 			try
 			{
-				for (unsigned mode = 0; mode != 2 && !state.closing; ++mode)
+				for (unsigned mode = 0; mode != 2 && !state.closing && SUCCEEDED(apartment.result); ++mode)
 				{
 					state.mode = mode ? "dred-on" : "dred-off";
 					rrdiag::Options options;
@@ -160,7 +176,7 @@ private:
 			std::snprintf(summary, sizeof(summary), "HOST_FINISHED cases=%u mismatches=%u unavailable=%u selfTestsFailed=%u failed=%u closed=%u wallSeconds=%.3f cpuSeconds=%.3f",
 				cases, mismatches, unavailable, selfTestsFailed, failed ? 1 : 0, state.closing ? 1 : 0, elapsed, cpu);
 			Log(nullptr, summary);
-			if (!state.closing)
+			if (!state.closing && SUCCEEDED(apartment.result))
 			{
 				std::wstring text = (failed || selfTestsFailed) ? L"The tests finished with an error. " :
 					(mismatches ? L"The tests detected changed memory. " : L"The tests completed without detected memory changes. ");
