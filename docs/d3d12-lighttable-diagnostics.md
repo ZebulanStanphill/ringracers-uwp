@@ -1,95 +1,120 @@
 # Xbox light-table corruption diagnostic
 
-These notes record the pure-white-as-black failure with VibeRant D3D12 and
-Palette Rendering, and its shared-heap placement workaround. The 64 KB placement experiment did not help and was reverted.
-Encore and table updates are not prerequisites for the reported failure.
+These notes track the intermittent pure-white-as-black failure with VibeRant
+D3D12 and Palette Rendering. The 4 KB placement guard stopped the reported
+neighboring light-table corruption on Xbox One X, but a clean guard-only session
+does not establish a driver bug or prove the guard fixed the underlying cause.
+Encore and table updates are not prerequisites for the report.
 
-## Texture-canary diagnostic branch
+## Placement-probe diagnostic branch
 
-**This branch is diagnostic and is not for master.** It defaults both
-`RR_D3D12_TEXTURE_CANARIES` and `RR_D3D12_LIGHTTABLE_DIAGNOSTICS` to `1`.
-Define either as `0` to disable it. The earlier guard-only production defaults
-and historical audit below describe the preceding build.
+**This branch is diagnostic and is not for master.** It defaults
+`RR_D3D12_TEXTURE_CANARIES` and `RR_D3D12_LIGHTTABLE_DIAGNOSTICS` to `1`;
+define either as `0` to disable it. It includes ordinary game-texture
+texture canaries and the opt-in `d3d12_placementprobe` command. The placement
+probe uses private fresh heaps (and a committed-resource control), bypassing the
+texture arena and upload ring. It tests whether a real D3D12 copy into an owner
+can alter an adjacent sentinel under controlled placement conditions. It does
+not claim a fix or prove the cause of the original light-table failure.
+
+### Production canaries
 
 Every shared-heap texture requests its reported `SizeInBytes`, rounded up to
-4 KB, plus a 4 KB sentinel. The quarter-octave arena and its alignment-separated
-free lists are unchanged. A 32×32 RGBA8 canary texture sits immediately after
-that reported end. The device must grant exactly 4 KB size and alignment;
-otherwise a single fallback warning disables new canaries for the rest of the
-run, retaining plain guards. Committed textures have no canaries. A one-time
-`canary gap:` warning identifies a non-4-KB allocation size: the alignment gap
-could hide a smaller overrun.
+4 KB, plus a 4 KB sentinel and a final 4 KB blind guard. The arena classes and
+alignment-separated free lists are unchanged. A 32×32 RGBA8 canary sits after
+the owner allocation; its raw words are `0xC4000000 ^ (uint32(canaryId) *
+2654435761) ^ texelIndex`, for row-major indices 0–1023. A one-time fallback
+warning disables new canaries if the device does not grant exactly 4 KB size
+and alignment. Committed textures have no production canary. `allZero` means
+every changed word is zero; it does not mean the entire sentinel was cleared.
 
-The canary is initialized before its owner's first upload. Its raw 32-bit texel
-words are `0xC4000000 ^ (uint32(canaryId) * 2654435761) ^ texelIndex`, with
-row-major indices 0–1023. Other canaries' moved data can therefore be identified.
-It has no shader descriptor. Three readback pages each hold 64 slots of 8192
-bytes (32 rows at 256-byte pitch). Checks copy at most 64 canaries each frame,
-prioritizing completed owner uploads and a repeat approximately 60 frames later,
-then manual requests and a round-robin sweep. Buffers are mapped only after the
-covering submission completes; unavailable pages defer checking without a CPU
-wait or an extra submission. The existing automatic light-table diagnostics
-still submit and wait synchronously and can affect reproduction timing.
+The new layout retains a blind 4 KB after each production canary. Earlier
+canaries had no guaranteed blind guard after the sentinel. In the Xbox log,
+owner 207 occupied offset 2,154,496 for 16,384 bytes; sentinel 208 began at
+2,170,880 and was 4,096 bytes; the next table began at 2,174,976, exactly at
+the sentinel's end. The sentinel directly followed the owner, so the owner's
+first 4 KB guard was the sentinel itself. Eight light-table creation checks
+were clean. Each of 857 distinct canaries had exactly one changed word: its
+first texel changed from the initialized pattern to zero. Separately, two
+light tables later lost their first texel, changing from their CPU-expected
+color to zero. These differences do not establish that owner 207 caused them.
+The sentinel was initialized before the table upload, so
+an upload-time overrun could have been overwritten by that table upload; later
+sentinel operations or cross-writes also remain possible. The captured run
+reported normal and small placements, no fallback/device errors or budget
+exhaustion, a 636.83 MB peak texture heap, and 672 MB allocated across 42 heaps.
+These observations do not establish an owner overrun.
+
+Canary reads are asynchronous and bounded. Three readback pages each hold 64
+slots of 8192 bytes (32 rows at 256-byte pitch). Checks copy at most 64 canaries
+each frame, prioritizing completed owner uploads and a repeat approximately 60
+frames later, then manual requests and a round-robin sweep. Buffers are mapped
+only after the covering submission completes; unavailable pages defer checking
+without a CPU wait or extra submission. The existing automatic light-table
+diagnostics still submit and wait synchronously and can change reproduction
+timing.
 
 Readback slots retain unique canary IDs, never texture pointers. Owner retirement
-cancels its queued/manual comparisons, and a submitted result is discarded if
-its ID is no longer live. The busy slot is retained until its fence completes;
+cancels queued/manual comparisons, and a submitted result is discarded if its
+ID is no longer live. The busy slot is retained until its fence completes;
 canary resources and the whole owner block retire at the owner's pending fence.
-This avoids reading a replacement as the old owner. A manual request covers the
-live set at invocation; subsequent creations belong to later requests. Removed
-owners count as cancellations. A repeated command replaces the outstanding
-request, and pre-request copies do not satisfy the new request.
+A manual request covers the live set at invocation; subsequent creations belong
+to later requests. Removed owners count as cancellations. A repeated command
+replaces the outstanding request, and pre-request copies do not satisfy the new
+request.
+
+`UWP D3D12: canary summary:` reports cumulative created, checked, corrupt and
+fallback counts plus the current live count, about every ten seconds and on
+manual completion. A successful manual completion means every surviving
+requested ID was compared; retired owners are cancellations. Allocation/Map
+errors make checks unavailable, not successful comparisons.
+
+`UWP D3D12: canary mismatch:` reports canary and owner IDs, dimensions, format,
+mips, placement/alignment, `SizeInBytes`, copyable-footprint bytes, heap/block
+and canary offsets, alignment gap, creation frame/fence, latest upload fence,
+changed texel count and `allZero`. It prints up to sixteen `(x,y)
+expected->observed` values as raw 32-bit words, not the palette probe's RRGGBBAA
+notation. Identical corrupt contents log once; changed contents log an update,
+with bounded texture history. `allZero` means every changed word is zero, not
+that all 1024 words changed. `canary lighttable mismatch:` is a rate-limited
+warning. D3D12 tiled layouts make texel indices unsuitable as a portable
+physical byte-distance measurement.
+
+### Isolated placement probe
+
+Run `d3d12_placementprobe` with no arguments, in a menu or level. It exercises
+`adjacent-normal` (256×256), `adjacent-small` (64×64), `guarded-normal`,
+`guarded-small`, and `committed-control`. The adjacent cases place the sentinel
+after the owner; guarded cases insert a 4 KB gap. Each placed case uses a
+private fresh heap and a final 4 KB blind tail after the sentinel. The control
+uses committed owner and sentinel resources. These cases avoid the shared
+texture arena and staging ring.
+
+Before creating the owner, the probe initializes the sentinel and compares two
+independent readbacks twice. It then creates and activates the owner, uploads
+to it, transitions it for pixel-shader resource use, and repeats sentinel
+readbacks after each stage, including after a separate full owner readback.
+Every case also checks a raw-buffer-to-readback copy. Logs use
+`placementprobe start:`, `placementprobe check:` and `placementprobe case end:`
+with the case, stage and result. Results are `clean`,
+`mismatch` or `unavailable`; the first failing stage is meaningful only when
+the baseline was clean. The two readbacks report whether their outputs match.
+The optional WARP negative-control hook overwrites only the sentinel's first
+word through a real copy, validating mismatch detection without establishing an
+Xbox cause. Errors and unavailable comparisons are not passes.
 
 ### Xbox procedure
 
-1. Install the artifact from this diagnostic branch. Enable VibeRant D3D12 and
-   Palette Rendering. Start a fresh session and play **Metropolis**, including
-   the mid-race period that reproduced white rendering as black.
-2. Play for several minutes. Automatic canary sweeps, light-table checks and
-   event history require no console command. Optionally run
-   `d3d12_canarycheck`, then keep playing until `reason=manual-complete` appears.
-3. If white turns black, keep Palette Rendering enabled and optionally run
-   `d3d12_paletteprobe` before toggling it or restarting the race.
-4. Send the complete `E:\ringracers\latest-log.txt` from startup through failure
-   and recovery, with track, Encore status and approximate failure time.
+1. Install the new diagnostic branch build and enable the UWP profile, VibeRant
+   D3D12, and Palette Rendering.
+2. Run `d3d12_placementprobe` once, in a menu or level. Play Metropolis for
+   several minutes. Optionally run `d3d12_canarycheck` while reproducing.
+3. Send `E:\ringracers\latest-log.txt` and `uwp-profile.txt`, and report whether
+   black or disappearing pixels appeared and when.
 
-### Canary logs and interpretation
-
-`UWP D3D12: canary summary: live=… created=… checked=… corrupt=… fallback=…`
-prints about every ten seconds and on manual completion. `created`, `checked`,
-`corrupt` and `fallback` are cumulative: `checked` counts comparisons, `corrupt`
-counts distinct ever-corrupt canaries, and `fallback` counts owners receiving a
-plain guard instead of a canary. `live` counts current canaries. A successful
-manual completion means every surviving requested ID was compared; owners
-retired during the request were cancelled. Allocation/Map errors make checks
-unavailable and do not count as successful comparisons.
-
-`UWP D3D12: canary mismatch:` prints the canary ID, owner diagnostic ID,
-width/height, DXGI format number, mip count, small/normal placement, alignment,
-`SizeInBytes`, complete owner `GetCopyableFootprints` bytes, heap index,
-block offset/size, canary offset and alignment gap, creation frame/fence,
-latest owner upload fence, current frame, changed texel count and `allZero`.
-The first sixteen changed texels show `(x,y) expected->observed` as **raw
-32-bit words**, not the palette probe's RRGGBBAA notation. Identical corrupt
-contents log once; changed corrupt contents log an update. A mismatch also
-dumps the bounded texture event history. `canary lighttable mismatch:` is a
-rate-limited warning that a light table still differs while canaries are enabled.
-
-A changed canary confirms an unintended write outside an owner's reported
-allocation or another cross-resource write; compare the event history to exclude
-the deliberate WARP test hook. All-zero changed words suggest a clear/zeroing
-write; recognizable owner data or another canary's pattern suggests a copy or
-moved-data write. Placement offsets establish the sentinel's distance from the
-owner's allocation end, while changed texel coordinates describe the damaged
-sentinel. D3D12's opaque tiled texture layout means texel indices are not a
-portable physical byte-distance measurement.
-
-A corrupt light table with unchanged canaries contradicts the adjacent 4 KB
-overrun theory (or indicates damage beyond the sentinel, a gap, or missing
-coverage); check fallback and readback errors before drawing that conclusion.
-A clean session alone does not prove a fix, since this diagnostic build changes
-resources, timing and GPU work. Windows WARP checks validate the machinery,
-including a deliberate canary overwrite, but cannot establish Xbox behavior.
+The probe and canaries are diagnostics; they make no rendering-fix claim.
+WARP validates the probe machinery, including its deliberate overwrite, but
+cannot establish Xbox behavior. A clean session alone is not proof of a fix.
 
 ## Guard workaround (before this diagnostic branch)
 
@@ -113,9 +138,10 @@ including a deliberate canary overwrite, but cannot establish Xbox behavior.
   Define `RR_D3D12_LIGHTTABLE_DIAGNOSTICS` to enable automatic checks and event
   history in a diagnostic build, as the Windows WARP harness does.
 
-The procedure, log format and audit below describe the diagnostic build that
-found the failure. They are kept as a record; the automatic checks run only in a
-build with `kLightTableDiagnostics` turned on.
+The procedure, log format and audit below preserve the earlier light-table
+diagnostic investigation. The new placement-probe procedure above applies to the
+current diagnostic branch; automatic light-table checks still require
+`kLightTableDiagnostics` to be enabled.
 
 ## Xbox procedure (historical)
 

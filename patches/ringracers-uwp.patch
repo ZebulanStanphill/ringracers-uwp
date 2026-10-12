@@ -1,4 +1,4 @@
-From a1369828b53445c9937d2d3375a21aefc0297fab Mon Sep 17 00:00:00 2001
+From 0267ff37eb6d5af81d960e76e6ba67333221f225 Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -657,122 +657,134 @@ Model: gpt-6.1-sol
 Agent: Claude Code (Haiku)
 Model: claude-haiku-5-5
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- [UWP]: Keep a blind 4 KB tail after each production canary sentinel. Add the staged `d3d12_placementprobe` diagnostic using fresh private heaps and dedicated upload/readback resources, with repeated two-readback baselines before owner creation and checks after creation, activation, upload/readback, and transition. Include guarded placement cases, committed-resource and raw-buffer controls, and a real first-word-zero negative control. No root cause or rendering fix is claimed.
+
+Agent: Codex (/root, placement probe design and review)
+Model: gpt-6.1-sol
+Agent: Codex (/root/placement_probe_implementation, placement probe implementation and tests)
+Model: gpt-6.1-sol
+Agent: Codex (/root/canary_code_review, placement diagnostic review)
+Model: gpt-6.1-sol
+Agent: Codex (/root/placement_probe_docs, documentation and patch export)
+Model: gpt-6-luna
 ---
- CMakeLists.txt                              |   19 +-
- CMakePresets.json                           |   17 +
- src/CMakeLists.txt                          |   44 +-
- src/console.c                               |   57 +
- src/console.h                               |   11 +
- src/core/thread_pool.cpp                    |   19 +
- src/cvars.cpp                               |   15 +
- src/d_clisrv.c                              |   49 +
- src/d_main.cpp                              |  368 +-
- src/doomstat.h                              |    1 +
- src/f_finale.c                              |   10 +
- src/f_wipe.cpp                              |   35 +-
- src/g_game.c                                |   56 +
- src/hardware/CMakeLists.txt                 |   69 +
- src/hardware/hw_batching.c                  |   11 +-
- src/hardware/hw_bsp.c                       |  110 +-
- src/hardware/hw_cache.c                     |  359 +-
- src/hardware/hw_clip.c                      |   15 +
- src/hardware/hw_clip.h                      |    5 +
- src/hardware/hw_defs.h                      |   11 +-
- src/hardware/hw_draw.c                      |  116 +-
- src/hardware/hw_drv.h                       |   13 +
- src/hardware/hw_glob.h                      |   13 +
- src/hardware/hw_glsl.h                      |  321 +
- src/hardware/hw_main.c                      | 2135 +++++-
- src/hardware/hw_main.h                      |   21 +-
- src/hardware/hw_md2.c                       |  304 +-
- src/hardware/hw_md2.h                       |    4 +
- src/hardware/r_d3d11/custom_shader.cpp      |  308 +
- src/hardware/r_d3d11/custom_shader.h        |   12 +
- src/hardware/r_d3d11/custom_shaders.cmake   |   58 +
- src/hardware/r_d3d11/r_d3d11.cpp            | 6420 +++++++++++++++++++
- src/hardware/r_d3d11/r_d3d11.h              |   72 +
- src/hardware/r_d3d11/shaders.hlsl           |  660 ++
- src/hardware/r_d3d12/allocators.h           |  212 +
- src/hardware/r_d3d12/d3d12_arenas.inc       |   94 +
- src/hardware/r_d3d12/d3d12_canaries.inc     |  294 +
- src/hardware/r_d3d12/d3d12_captures.inc     |  272 +
- src/hardware/r_d3d12/d3d12_core.cpp         |  845 +++
- src/hardware/r_d3d12/d3d12_core.h           |  140 +
- src/hardware/r_d3d12/d3d12_interop.cpp      |  558 ++
- src/hardware/r_d3d12/d3d12_interop.h        |   49 +
- src/hardware/r_d3d12/d3d12_models.inc       |  516 ++
- src/hardware/r_d3d12/d3d12_palette.inc      |  330 +
- src/hardware/r_d3d12/d3d12_paletteprobe.inc |  259 +
- src/hardware/r_d3d12/d3d12_pipeline.cpp     |  173 +
- src/hardware/r_d3d12/d3d12_pipeline.h       |   58 +
- src/hardware/r_d3d12/d3d12_present.cpp      | 1620 +++++
- src/hardware/r_d3d12/d3d12_present.h        |   50 +
- src/hardware/r_d3d12/d3d12_prewarm.cpp      |  212 +
- src/hardware/r_d3d12/d3d12_prewarm.h        |   17 +
- src/hardware/r_d3d12/d3d12_screens.inc      |  580 ++
- src/hardware/r_d3d12/d3d12_upload.cpp       |  112 +
- src/hardware/r_d3d12/d3d12_upload.h         |   54 +
- src/hardware/r_d3d12/mips.h                 |   60 +
- src/hardware/r_d3d12/pipeline_key.h         |   51 +
- src/hardware/r_d3d12/r_d3d12.cpp            | 3163 +++++++++
- src/hardware/r_d3d12/r_d3d12.h              |   72 +
- src/hardware/r_d3d12/texture_repack.h       |   36 +
- src/hardware/r_opengl/r_opengl.c            |  308 +-
- src/http-mserv.c                            |    2 +
- src/hwr2/patch_atlas.cpp                    |    8 +
- src/hwr2/resource_management.cpp            |  105 +-
- src/hwr2/resource_management.hpp            |   31 +-
- src/i_system.h                              |   74 +
- src/i_video_common.cpp                      |   60 +-
- src/k_menu.h                                |   13 +-
- src/k_menufunc.c                            |    2 +-
- src/lua_script.c                            |  127 +
- src/m_fixed.h                               |   11 +
- src/m_perfstats.c                           |  244 +
- src/m_perfstats.h                           |   11 +
- src/md5.c                                   |   19 +-
- src/md5.h                                   |   31 +-
- src/menus/options-1.c                       |   34 +
- src/menus/options-video-advanced.c          |   47 +-
- src/p_lights.c                              |    9 +
- src/p_mobj.c                                |  113 +-
- src/p_mobj.h                                |   11 +
- src/p_setup.cpp                             |   55 +
- src/p_tick.c                                |    3 +
- src/p_tick.h                                |   15 +
- src/p_user.c                                |    3 +-
- src/r_draw.h                                |   38 +-
- src/r_draw_column.cpp                       |   18 +-
- src/r_fps.cpp                               |   25 +-
- src/r_main.cpp                              |  181 +-
- src/r_main.h                                |    8 +
- src/r_plane.cpp                             |   19 +-
- src/r_segs.cpp                              |   15 +-
- src/r_sky.c                                 |    4 +-
- src/r_textures.cpp                          |    2 +
- src/r_textures.h                            |   10 +
- src/r_things.cpp                            |  160 +-
- src/r_things.h                              |    7 +
- src/rhi/gl2/gl2_rhi.cpp                     |  618 +-
- src/rhi/gl2/gl2_rhi.hpp                     |   36 +
- src/screen.c                                |    4 +-
- src/sdl/CMakeLists.txt                      |    5 +
- src/sdl/hwsym_sdl.c                         |    7 +
- src/sdl/i_main.cpp                          |   11 +-
- src/sdl/i_system.cpp                        |   99 +-
- src/sdl/i_uwpd3d12.cpp                      |  130 +
- src/sdl/i_uwpprofile.cpp                    |  886 +++
- src/sdl/i_uwptrace.h                        |   25 +
- src/sdl/i_video.cpp                         |  102 +-
- src/sdl/mixer_sound.c                       |    4 +-
- src/sdl/ogl_sdl.c                           |    8 +
- src/sdl/rhi_gl2_platform.cpp                |    9 +
- src/st_stuff.c                              |   10 +-
- src/v_video.cpp                             |   35 +-
- src/w_wad.cpp                               |  312 +
- src/w_wad.h                                 |   11 +
- src/z_zone.cpp                              |    5 +
- 114 files changed, 24568 insertions(+), 1137 deletions(-)
+ CMakeLists.txt                                |   19 +-
+ CMakePresets.json                             |   17 +
+ src/CMakeLists.txt                            |   44 +-
+ src/console.c                                 |   57 +
+ src/console.h                                 |   11 +
+ src/core/thread_pool.cpp                      |   19 +
+ src/cvars.cpp                                 |   15 +
+ src/d_clisrv.c                                |   49 +
+ src/d_main.cpp                                |  368 +-
+ src/doomstat.h                                |    1 +
+ src/f_finale.c                                |   10 +
+ src/f_wipe.cpp                                |   35 +-
+ src/g_game.c                                  |   56 +
+ src/hardware/CMakeLists.txt                   |   69 +
+ src/hardware/hw_batching.c                    |   11 +-
+ src/hardware/hw_bsp.c                         |  110 +-
+ src/hardware/hw_cache.c                       |  359 +-
+ src/hardware/hw_clip.c                        |   15 +
+ src/hardware/hw_clip.h                        |    5 +
+ src/hardware/hw_defs.h                        |   11 +-
+ src/hardware/hw_draw.c                        |  116 +-
+ src/hardware/hw_drv.h                         |   13 +
+ src/hardware/hw_glob.h                        |   13 +
+ src/hardware/hw_glsl.h                        |  321 +
+ src/hardware/hw_main.c                        | 2136 +++++-
+ src/hardware/hw_main.h                        |   21 +-
+ src/hardware/hw_md2.c                         |  304 +-
+ src/hardware/hw_md2.h                         |    4 +
+ src/hardware/r_d3d11/custom_shader.cpp        |  308 +
+ src/hardware/r_d3d11/custom_shader.h          |   12 +
+ src/hardware/r_d3d11/custom_shaders.cmake     |   58 +
+ src/hardware/r_d3d11/r_d3d11.cpp              | 6420 +++++++++++++++++
+ src/hardware/r_d3d11/r_d3d11.h                |   72 +
+ src/hardware/r_d3d11/shaders.hlsl             |  660 ++
+ src/hardware/r_d3d12/allocators.h             |  212 +
+ src/hardware/r_d3d12/d3d12_arenas.inc         |   94 +
+ src/hardware/r_d3d12/d3d12_canaries.inc       |  296 +
+ src/hardware/r_d3d12/d3d12_captures.inc       |  272 +
+ src/hardware/r_d3d12/d3d12_core.cpp           |  845 +++
+ src/hardware/r_d3d12/d3d12_core.h             |  140 +
+ src/hardware/r_d3d12/d3d12_interop.cpp        |  558 ++
+ src/hardware/r_d3d12/d3d12_interop.h          |   49 +
+ src/hardware/r_d3d12/d3d12_models.inc         |  516 ++
+ src/hardware/r_d3d12/d3d12_palette.inc        |  330 +
+ src/hardware/r_d3d12/d3d12_paletteprobe.inc   |  259 +
+ src/hardware/r_d3d12/d3d12_pipeline.cpp       |  173 +
+ src/hardware/r_d3d12/d3d12_pipeline.h         |   58 +
+ src/hardware/r_d3d12/d3d12_placementprobe.inc |  282 +
+ src/hardware/r_d3d12/d3d12_present.cpp        | 1620 +++++
+ src/hardware/r_d3d12/d3d12_present.h          |   50 +
+ src/hardware/r_d3d12/d3d12_prewarm.cpp        |  212 +
+ src/hardware/r_d3d12/d3d12_prewarm.h          |   17 +
+ src/hardware/r_d3d12/d3d12_screens.inc        |  580 ++
+ src/hardware/r_d3d12/d3d12_upload.cpp         |  112 +
+ src/hardware/r_d3d12/d3d12_upload.h           |   54 +
+ src/hardware/r_d3d12/mips.h                   |   60 +
+ src/hardware/r_d3d12/pipeline_key.h           |   51 +
+ src/hardware/r_d3d12/r_d3d12.cpp              | 3178 ++++++++
+ src/hardware/r_d3d12/r_d3d12.h                |   76 +
+ src/hardware/r_d3d12/texture_repack.h         |   36 +
+ src/hardware/r_opengl/r_opengl.c              |  308 +-
+ src/http-mserv.c                              |    2 +
+ src/hwr2/patch_atlas.cpp                      |    8 +
+ src/hwr2/resource_management.cpp              |  105 +-
+ src/hwr2/resource_management.hpp              |   31 +-
+ src/i_system.h                                |   74 +
+ src/i_video_common.cpp                        |   60 +-
+ src/k_menu.h                                  |   13 +-
+ src/k_menufunc.c                              |    2 +-
+ src/lua_script.c                              |  127 +
+ src/m_fixed.h                                 |   11 +
+ src/m_perfstats.c                             |  244 +
+ src/m_perfstats.h                             |   11 +
+ src/md5.c                                     |   19 +-
+ src/md5.h                                     |   31 +-
+ src/menus/options-1.c                         |   34 +
+ src/menus/options-video-advanced.c            |   47 +-
+ src/p_lights.c                                |    9 +
+ src/p_mobj.c                                  |  113 +-
+ src/p_mobj.h                                  |   11 +
+ src/p_setup.cpp                               |   55 +
+ src/p_tick.c                                  |    3 +
+ src/p_tick.h                                  |   15 +
+ src/p_user.c                                  |    3 +-
+ src/r_draw.h                                  |   38 +-
+ src/r_draw_column.cpp                         |   18 +-
+ src/r_fps.cpp                                 |   25 +-
+ src/r_main.cpp                                |  181 +-
+ src/r_main.h                                  |    8 +
+ src/r_plane.cpp                               |   19 +-
+ src/r_segs.cpp                                |   15 +-
+ src/r_sky.c                                   |    4 +-
+ src/r_textures.cpp                            |    2 +
+ src/r_textures.h                              |   10 +
+ src/r_things.cpp                              |  160 +-
+ src/r_things.h                                |    7 +
+ src/rhi/gl2/gl2_rhi.cpp                       |  618 +-
+ src/rhi/gl2/gl2_rhi.hpp                       |   36 +
+ src/screen.c                                  |    4 +-
+ src/sdl/CMakeLists.txt                        |    5 +
+ src/sdl/hwsym_sdl.c                           |    7 +
+ src/sdl/i_main.cpp                            |   11 +-
+ src/sdl/i_system.cpp                          |   99 +-
+ src/sdl/i_uwpd3d12.cpp                        |  130 +
+ src/sdl/i_uwpprofile.cpp                      |  886 +++
+ src/sdl/i_uwptrace.h                          |   25 +
+ src/sdl/i_video.cpp                           |  102 +-
+ src/sdl/mixer_sound.c                         |    4 +-
+ src/sdl/ogl_sdl.c                             |    8 +
+ src/sdl/rhi_gl2_platform.cpp                  |    9 +
+ src/st_stuff.c                                |   10 +-
+ src/v_video.cpp                               |   35 +-
+ src/w_wad.cpp                                 |  312 +
+ src/w_wad.h                                   |   11 +
+ src/z_zone.cpp                                |    5 +
+ 115 files changed, 24872 insertions(+), 1137 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -793,6 +805,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 src/hardware/r_d3d12/d3d12_paletteprobe.inc
  create mode 100644 src/hardware/r_d3d12/d3d12_pipeline.cpp
  create mode 100644 src/hardware/r_d3d12/d3d12_pipeline.h
+ create mode 100644 src/hardware/r_d3d12/d3d12_placementprobe.inc
  create mode 100644 src/hardware/r_d3d12/d3d12_present.cpp
  create mode 100644 src/hardware/r_d3d12/d3d12_present.h
  create mode 100644 src/hardware/r_d3d12/d3d12_prewarm.cpp
@@ -3616,7 +3629,7 @@ index 0000000..c025b5a
 +
 +#endif
 diff --git a/src/hardware/hw_main.c b/src/hardware/hw_main.c
-index b5e8fca..85b44a3 100644
+index b5e8fca..e8765c5 100644
 --- a/src/hardware/hw_main.c
 +++ b/src/hardware/hw_main.c
 @@ -12,8 +12,13 @@
@@ -6460,7 +6473,7 @@ index b5e8fca..85b44a3 100644
  //added by Hurdler: console varibale that are saved
  void HWR_AddCommands(void)
  {
-@@ -6094,6 +7786,11 @@ void HWR_AddSessionCommands(void)
+@@ -6094,6 +7786,12 @@ void HWR_AddSessionCommands(void)
  {
  	if (gl_sessioncommandsadded)
  		return;
@@ -6468,11 +6481,12 @@ index b5e8fca..85b44a3 100644
 +	COM_AddCommand("gr_surfaceprobe", HWR_SurfaceProbe_f);
 +	COM_AddCommand("d3d12_paletteprobe", D3D12_PaletteProbe_f);
 +	COM_AddCommand("d3d12_canarycheck", D3D12_CanaryCheck_f);
++	COM_AddCommand("d3d12_placementprobe", D3D12_PlacementProbe_f);
 +#endif
  	// Kept in case we ever need this again.
  	gl_sessioncommandsadded = true;
  }
-@@ -6138,6 +7835,8 @@ void HWR_Switch(void)
+@@ -6138,6 +7836,8 @@ void HWR_Switch(void)
  	// Set special states from CVARs
  	HWD.pfnSetSpecialState(HWD_SET_TEXTUREFILTERMODE, cv_glfiltermode.value);
  	HWD.pfnSetSpecialState(HWD_SET_TEXTUREANISOTROPICMODE, cv_glanisotropicmode.value);
@@ -6481,7 +6495,7 @@ index b5e8fca..85b44a3 100644
  
  	// Load textures
  	if (!gl_maptexturesloaded)
-@@ -6241,6 +7940,9 @@ void HWR_RenderWall(FOutVector *wallVerts, FSurfaceInfo *pSurf, FBITFIELD blend,
+@@ -6241,6 +7941,9 @@ void HWR_RenderWall(FOutVector *wallVerts, FSurfaceInfo *pSurf, FBITFIELD blend,
  		blendmode |= PF_Fog;
  
  	blendmode |= PF_Modulated;	// No PF_Occlude means overlapping (incorrect) transparency
@@ -6491,7 +6505,7 @@ index b5e8fca..85b44a3 100644
  	HWR_ProcessPolygon(pSurf, wallVerts, 4, blendmode, shader, false);
  }
  
-@@ -6257,7 +7959,8 @@ void HWR_DoPostProcessor(player_t *player)
+@@ -6257,7 +7960,8 @@ void HWR_DoPostProcessor(player_t *player)
  
  	// Armageddon Blast Flash!
  	// Could this even be considered postprocessor?
@@ -6501,7 +6515,7 @@ index b5e8fca..85b44a3 100644
  	{
  		FOutVector      v[4];
  		FSurfaceInfo Surf;
-@@ -6266,6 +7969,9 @@ void HWR_DoPostProcessor(player_t *player)
+@@ -6266,6 +7970,9 @@ void HWR_DoPostProcessor(player_t *player)
  		v[0].y = v[1].x = v[1].y = v[2].x = 4.0f;
  		v[0].z = v[1].z = v[2].z = v[3].z = 4.0f; // 4.0 because of the same reason as with the sky, just after the screen is cleared so near clipping plane is 3.99
  
@@ -6511,7 +6525,7 @@ index b5e8fca..85b44a3 100644
  		// This won't change if the flash palettes are changed unfortunately, but it works for its purpose
  		if (player->flashpal == PAL_NUKE)
  		{
-@@ -6284,15 +7990,23 @@ void HWR_DoPostProcessor(player_t *player)
+@@ -6284,15 +7991,23 @@ void HWR_DoPostProcessor(player_t *player)
  	if(gamestate != GS_INTERMISSION)
  		HWD.pfnMakeScreenTexture();
  
@@ -6537,7 +6551,7 @@ index b5e8fca..85b44a3 100644
  
  		UINT8 x, y;
  		INT32 WAVELENGTH;
-@@ -6318,13 +8032,26 @@ void HWR_DoPostProcessor(player_t *player)
+@@ -6318,13 +8033,26 @@ void HWR_DoPostProcessor(player_t *player)
  			for (y = 0; y < SCREENVERTS; y++)
  			{
  				// Change X position based on its Y position.
@@ -14955,10 +14969,10 @@ index 0000000..8eda11b
 +}
 diff --git a/src/hardware/r_d3d12/d3d12_canaries.inc b/src/hardware/r_d3d12/d3d12_canaries.inc
 new file mode 100644
-index 0000000..d4b8af6
+index 0000000..1de904a
 --- /dev/null
 +++ b/src/hardware/r_d3d12/d3d12_canaries.inc
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,296 @@
 +// DR. ROBOTNIK'S RING RACERS
 +// This program is free software distributed under the GNU GPL, version 2.
 +// Included by r_d3d12.cpp: diagnostic adjacent placed-texture sentinels.
@@ -15074,7 +15088,7 @@ index 0000000..d4b8af6
 +	const auto granted = Core_Device()->GetResourceAllocationInfo(0, 1, &sentinel);
 +	if (granted.Alignment != 4096 || granted.SizeInBytes != 4096)
 +	{
-+		Log("canary fallback: 32x32 small placement unavailable alignment=%llu size=%llu; plain 4 KB guards for this run",
++		Log("canary fallback: 32x32 small placement unavailable alignment=%llu size=%llu; reserved blind guards for this run",
 +			(unsigned long long)granted.Alignment, (unsigned long long)granted.SizeInBytes);
 +		g_canaryPlacementDisabled = true; ++g_canaryFallback; return;
 +	}
@@ -15097,7 +15111,7 @@ index 0000000..d4b8af6
 +		&sentinel, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&canary.res));
 +	if (FAILED(hr))
 +	{
-+		Log("canary fallback: CreatePlacedResource failed 0x%08x; plain 4 KB guards for this run", (unsigned)hr);
++		Log("canary fallback: CreatePlacedResource failed 0x%08x; reserved blind guards for this run", (unsigned)hr);
 +		g_canaryPlacementDisabled = true; ++g_canaryFallback; return;
 +	}
 +	Core_FlushBarriers();
@@ -15108,7 +15122,7 @@ index 0000000..d4b8af6
 +	if (!UploadCanary(canary))
 +	{
 +		Core_Retire(canary.res);
-+		Log("canary fallback: pattern upload failed; plain 4 KB guards for this run");
++		Log("canary fallback: pattern upload failed; reserved blind guards for this run");
 +		g_canaryPlacementDisabled = true; ++g_canaryFallback; return;
 +	}
 +	canary.uploadFence = Core_PendingFence();
@@ -15116,6 +15130,8 @@ index 0000000..d4b8af6
 +	owner.canaryId = canary.id;
 +	g_canaries.emplace(canary.id, std::move(canary));
 +	++g_canaryCreated;
++	if (g_canaryCreated == 1)
++		Log("canary layout: rounded owner + 4096-byte sentinel + 4096-byte blind tail; arena alignment/classes unchanged");
 +}
 +void CanaryUploaded(const GpuTexture &owner)
 +{
@@ -15148,7 +15164,7 @@ index 0000000..d4b8af6
 +		if (!canary.everCorrupt) { ++g_canaryCorrupt; canary.everCorrupt = true; }
 +		const auto &d = canary.ownerDesc;
 +		Log("canary mismatch: id=%llu owner=%u width=%llu height=%u format=%u mips=%u placement=%s alignment=%llu "
-+			"SizeInBytes=%llu copyBytes=%llu heap=%u blockOffset=%llu blockSize=%llu canaryOffset=%llu gap=%llu "
++			"SizeInBytes=%llu copyBytes=%llu heap=%u blockOffset=%llu blockSize=%llu canaryOffset=%llu gap=%llu blindTail=4096 "
 +			"creationFrame=%llu creationFence=%llu uploadFence=%llu frame=%llu changed=%u allZero=%d first:%s (raw 32-bit words)",
 +			(unsigned long long)canary.id, canary.owner, (unsigned long long)d.Width, d.Height, (UINT)d.Format, d.MipLevels,
 +			canary.smallPlacement ? "small" : "normal", (unsigned long long)canary.alignment, (unsigned long long)canary.size,
@@ -18513,6 +18529,294 @@ index 0000000..1de98e1
 +const char *ShaderName(PSKind kind);
 +} // namespace rr_d3d12
 +#endif
+diff --git a/src/hardware/r_d3d12/d3d12_placementprobe.inc b/src/hardware/r_d3d12/d3d12_placementprobe.inc
+new file mode 100644
+index 0000000..bb52050
+--- /dev/null
++++ b/src/hardware/r_d3d12/d3d12_placementprobe.inc
+@@ -0,0 +1,282 @@
++// DR. ROBOTNIK'S RING RACERS
++// This program is free software distributed under the GNU GPL, version 2.
++// Included by r_d3d12.cpp: diagnostic isolated placed-texture experiment.
++#ifdef RR_D3D12_TEST_PLACEMENTPROBE
++bool g_placementProbeFault = false;
++#endif
++UINT32 PlacementPattern(UINT seed, UINT index)
++{
++	return 0xA5000001u | (((seed * 0x13579u + index * 0x10203u) & 0x00FFFFFFu) << 1);
++}
++struct PlacementFixture
++{
++	const char *name;
++	UINT seed;
++	ComPtr<ID3D12Heap> heap;
++	ComPtr<ID3D12Resource> sentinel, owner, sentinelUpload, ownerUpload, ownerReadback;
++	std::array<ComPtr<ID3D12Resource>, 2> readback;
++	D3D12_PLACED_SUBRESOURCE_FOOTPRINT sentinelFootprint = {}, ownerFootprint = {};
++	UINT64 sentinelBytes = 0, ownerBytes = 0, lastFence = 0;
++	D3D12_RESOURCE_STATES sentinelState = D3D12_RESOURCE_STATE_COPY_DEST;
++	D3D12_RESOURCE_STATES ownerState = D3D12_RESOURCE_STATE_COPY_DEST;
++	bool unavailable = false, mismatch = false, baselineClean = false;
++	const char *firstFailure = "none";
++	PlacementFixture(const char *n, UINT s) : name(n), seed(s) {}
++	~PlacementFixture()
++	{
++		// Also covers commands left pending after an allocation/map/submission/wait failure.
++		// Core_Retire's next fence is conservative even if the last submission timed out.
++		Core_Retire(sentinel); Core_Retire(owner); Core_Retire(sentinelUpload);
++		Core_Retire(ownerUpload); Core_Retire(ownerReadback);
++		for (auto &buffer : readback) Core_Retire(buffer);
++		Core_Retire(heap);
++	}
++	bool Error(const char *stage, const char *reason, HRESULT hr = S_OK)
++	{
++		unavailable = true;
++		Log("placementprobe unavailable: case=%s stage=%s reason=%s hr=0x%08x fence=%llu", name, stage,
++			reason, (unsigned)hr, (unsigned long long)lastFence);
++		return false;
++	}
++	bool Submit(const char *stage)
++	{
++		Core_FlushBarriers();
++		lastFence = Core_Submit("probe"); // Reopen invalidates root/draw bindings through the core callback.
++		const bool ok = lastFence && Core_Wait(lastFence, 500, "placementprobe") && Core_List();
++		Log("placementprobe fence: case=%s stage=%s fence=%llu result=%s", name, stage,
++			(unsigned long long)lastFence, ok ? "complete" : "unavailable");
++		return ok || Error(stage, "submission/fence failed, timed out (500 ms), or command-list reopen failed");
++	}
++	bool Buffer(ComPtr<ID3D12Resource> &buffer, UINT64 bytes, D3D12_HEAP_TYPE type)
++	{
++		D3D12_RESOURCE_DESC desc = {};
++		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width = bytes; desc.Height = 1;
++		desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
++		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++		D3D12_HEAP_PROPERTIES properties = {}; properties.Type = type;
++		const HRESULT hr = Core_Device()->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc,
++			type == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST,
++			nullptr, IID_PPV_ARGS(&buffer));
++		return SUCCEEDED(hr) || Error("allocate-buffers", "committed buffer allocation failed", hr);
++	}
++	bool Fill(ID3D12Resource *buffer, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &footprint, UINT64 bytes, UINT patternSeed)
++	{
++		void *data = nullptr; const D3D12_RANGE read = {0, 0};
++		const HRESULT hr = buffer->Map(0, &read, &data);
++		if (FAILED(hr)) return Error("initialize-upload", "Map failed", hr);
++		memset(data, 0x6d, (size_t)bytes); // Defined padding for the raw buffer-copy control.
++		for (UINT y = 0; y < footprint.Footprint.Height; ++y)
++			for (UINT x = 0; x < footprint.Footprint.Width; ++x)
++			{
++				const UINT32 value = PlacementPattern(patternSeed, y * footprint.Footprint.Width + x);
++				memcpy(static_cast<UINT8 *>(data) + footprint.Offset + y * footprint.Footprint.RowPitch + x * 4, &value, 4);
++			}
++		const D3D12_RANGE written = {0, (SIZE_T)bytes}; buffer->Unmap(0, &written);
++		return true;
++	}
++	void Alias(ID3D12Resource *resource)
++	{
++		Core_FlushBarriers();
++		D3D12_RESOURCE_BARRIER alias = {}; alias.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
++		alias.Aliasing.pResourceAfter = resource; Core_List()->ResourceBarrier(1, &alias);
++	}
++	void Upload(ID3D12Resource *texture, ID3D12Resource *buffer, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &footprint)
++	{
++		D3D12_TEXTURE_COPY_LOCATION from = {}, to = {};
++		from.pResource = buffer; from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; from.PlacedFootprint = footprint;
++		to.pResource = texture; to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++		Core_FlushBarriers(); Core_List()->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
++	}
++	void Read(ID3D12Resource *texture, D3D12_RESOURCE_STATES state, ID3D12Resource *buffer,
++		const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &footprint)
++	{
++		Core_Transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE); Core_FlushBarriers();
++		D3D12_TEXTURE_COPY_LOCATION from = {}, to = {};
++		from.pResource = texture; from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++		to.pResource = buffer; to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; to.PlacedFootprint = footprint;
++		Core_List()->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
++		Core_Transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
++	}
++	bool Values(ID3D12Resource *buffer, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &footprint,
++		UINT64 bytes, std::vector<UINT32> &values, const char *stage)
++	{
++		void *data = nullptr; const D3D12_RANGE read = {0, (SIZE_T)bytes};
++		const HRESULT hr = buffer->Map(0, &read, &data);
++		if (FAILED(hr)) return Error(stage, "readback Map failed", hr);
++		values.resize((size_t)footprint.Footprint.Width * footprint.Footprint.Height);
++		for (UINT y = 0; y < footprint.Footprint.Height; ++y)
++			memcpy(values.data() + y * footprint.Footprint.Width,
++				static_cast<const UINT8 *>(data) + footprint.Offset + y * footprint.Footprint.RowPitch,
++				(size_t)footprint.Footprint.Width * 4);
++		const D3D12_RANGE written = {0, 0}; buffer->Unmap(0, &written);
++		return true;
++	}
++	bool CheckSentinel(const char *stage)
++	{
++		for (auto &buffer : readback) Read(sentinel.Get(), sentinelState, buffer.Get(), sentinelFootprint);
++		if (!Submit(stage)) return false;
++		std::array<std::vector<UINT32>, 2> values;
++		for (UINT j = 0; j < 2; ++j)
++			if (!Values(readback[j].Get(), sentinelFootprint, sentinelBytes, values[j], stage)) return false;
++		UINT changed[2] = {}, first[2] = {UINT_MAX, UINT_MAX};
++		for (UINT j = 0; j < 2; ++j)
++			for (UINT i = 0; i < values[j].size(); ++i)
++				if (values[j][i] != PlacementPattern(seed, i)) { ++changed[j]; if (first[j] == UINT_MAX) first[j] = i; }
++		const bool bad = changed[0] || changed[1];
++		if (bad && !mismatch) firstFailure = stage;
++		mismatch |= bad;
++		Log("placementprobe check: case=%s stage=%s copyFence=%llu changedA=%u changedB=%u outputs=%s baseline=%s result=%s",
++			name, stage, (unsigned long long)lastFence, changed[0], changed[1], values[0] == values[1] ? "same" : "different",
++			baselineClean ? "clean" : "unestablished", bad ? "mismatch" : "clean");
++		for (UINT j = 0; j < 2; ++j)
++			if (changed[j]) Log("placementprobe difference: case=%s stage=%s readback=%c first=%u expected=0x%08x actual=0x%08x",
++				name, stage, 'A' + j, first[j], PlacementPattern(seed, first[j]), values[j][first[j]]);
++		return true;
++	}
++	bool RawControl()
++	{
++		for (auto &buffer : readback) Core_List()->CopyBufferRegion(buffer.Get(), 0, sentinelUpload.Get(), 0, sentinelBytes);
++		if (!Submit("raw-buffer-control")) return false;
++		// Compare all copied bytes, including padding, against independently reconstructed CPU bytes.
++		std::vector<UINT8> expected((size_t)sentinelBytes, 0x6d);
++		for (UINT y = 0; y < 32; ++y) for (UINT x = 0; x < 32; ++x)
++		{
++			const UINT32 value = PlacementPattern(seed, y * 32 + x);
++			memcpy(expected.data() + sentinelFootprint.Offset + y * sentinelFootprint.Footprint.RowPitch + x * 4, &value, 4);
++		}
++		for (UINT j = 0; j < 2; ++j)
++		{
++			void *data = nullptr; const D3D12_RANGE read = {0, (SIZE_T)sentinelBytes};
++			const HRESULT hr = readback[j]->Map(0, &read, &data);
++			if (FAILED(hr)) return Error("raw-buffer-control", "readback Map failed", hr);
++			const bool same = memcmp(expected.data(), data, expected.size()) == 0;
++			const D3D12_RANGE written = {0, 0}; readback[j]->Unmap(0, &written);
++			if (!same) return Error("raw-buffer-control", "raw upload/readback bytes differ");
++		}
++		Log("placementprobe raw-buffer-control: case=%s bytes=%llu first=0x%08x outputs=same result=clean", name,
++			(unsigned long long)sentinelBytes, PlacementPattern(seed, 0));
++		return true;
++	}
++	void Run(UINT width, bool smallPlacement, bool guarded, bool committed)
++	{
++		D3D12_RESOURCE_DESC desc = {};
++		desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; desc.Width = desc.Height = width;
++		desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1; desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++		desc.Alignment = smallPlacement ? D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT : 0;
++		const auto ownerInfo = Core_Device()->GetResourceAllocationInfo(0, 1, &desc);
++		D3D12_RESOURCE_DESC sentinelDesc = desc; sentinelDesc.Width = sentinelDesc.Height = 32;
++		sentinelDesc.Alignment = committed ? 0 : D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
++		const auto sentinelInfo = Core_Device()->GetResourceAllocationInfo(0, 1, &sentinelDesc);
++		if (ownerInfo.SizeInBytes == UINT64_MAX || !ownerInfo.Alignment ||
++			(smallPlacement && ownerInfo.Alignment != 4096) || (!committed && (sentinelInfo.Alignment != 4096 || sentinelInfo.SizeInBytes != 4096)))
++		{
++			Log("placementprobe allocation unsupported: case=%s ownerSize=%llu ownerAlignment=%llu sentinelSize=%llu sentinelAlignment=%llu", name,
++				(unsigned long long)ownerInfo.SizeInBytes, (unsigned long long)ownerInfo.Alignment,
++				(unsigned long long)sentinelInfo.SizeInBytes, (unsigned long long)sentinelInfo.Alignment);
++			Error("query-allocation", "requested placement unsupported (sentinel must be exactly 4096 bytes)"); return;
++		}
++		const UINT64 sentinelOffset = ownerInfo.SizeInBytes + (guarded ? 4096 : 0);
++		char sentinelOffsetText[32]; snprintf(sentinelOffsetText, sizeof(sentinelOffsetText), "%llu", (unsigned long long)sentinelOffset);
++		if (!committed && sentinelOffset % sentinelInfo.Alignment) { Error("query-allocation", "reported owner end is not sentinel-aligned"); return; }
++		D3D12_HEAP_DESC heapDesc = {};
++		heapDesc.SizeInBytes = std::max(UINT64(1024 * 1024), (sentinelOffset + 8192 + 65535) & ~UINT64(65535));
++		heapDesc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT; heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
++		Log("placementprobe case start: case=%s width=%u height=%u format=%u mips=1 placement=%s alignment=%llu SizeInBytes=%llu ownerOffset=%s sentinelOffset=%s sentinelSize=%llu gap=%u blindTail=%u heapBytes=%llu",
++			name, width, width, (UINT)desc.Format, committed ? "committed" : (smallPlacement ? "small" : "normal"),
++			(unsigned long long)ownerInfo.Alignment, (unsigned long long)ownerInfo.SizeInBytes, committed ? "N/A" : "0", committed ? "N/A" : sentinelOffsetText,
++			(unsigned long long)sentinelInfo.SizeInBytes, guarded ? 4096u : 0u, committed ? 0u : 4096u, committed ? 0ull : (unsigned long long)heapDesc.SizeInBytes);
++		D3D12_HEAP_PROPERTIES properties = {}; properties.Type = D3D12_HEAP_TYPE_DEFAULT;
++		HRESULT hr;
++		if (!committed)
++		{
++			hr = Core_Device()->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap));
++			if (FAILED(hr)) { Error("sentinel-create", "private heap allocation failed", hr); return; }
++			hr = Core_Device()->CreatePlacedResource(heap.Get(), sentinelOffset, &sentinelDesc, sentinelState, nullptr, IID_PPV_ARGS(&sentinel));
++		}
++		else
++		{
++			sentinelDesc.Alignment = 0;
++			hr = Core_Device()->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &sentinelDesc, sentinelState, nullptr, IID_PPV_ARGS(&sentinel));
++		}
++		if (FAILED(hr)) { Error("sentinel-create", "sentinel allocation failed", hr); return; }
++		Core_Device()->GetCopyableFootprints(&sentinelDesc, 0, 1, 0, &sentinelFootprint, nullptr, nullptr, &sentinelBytes);
++		Core_Device()->GetCopyableFootprints(&desc, 0, 1, 0, &ownerFootprint, nullptr, nullptr, &ownerBytes);
++		if (!Buffer(sentinelUpload, sentinelBytes, D3D12_HEAP_TYPE_UPLOAD) || !Buffer(ownerUpload, ownerBytes, D3D12_HEAP_TYPE_UPLOAD) ||
++			!Buffer(ownerReadback, ownerBytes, D3D12_HEAP_TYPE_READBACK)) return;
++		for (auto &buffer : readback) if (!Buffer(buffer, sentinelBytes, D3D12_HEAP_TYPE_READBACK)) return;
++		if (!Fill(sentinelUpload.Get(), sentinelFootprint, sentinelBytes, seed) ||
++			!Fill(ownerUpload.Get(), ownerFootprint, ownerBytes, seed + 101) || !RawControl()) return;
++		if (!committed) Alias(sentinel.Get());
++		Upload(sentinel.Get(), sentinelUpload.Get(), sentinelFootprint);
++		if (!Submit("sentinel-initialize") || !CheckSentinel("baseline-1") || !CheckSentinel("baseline-2")) return;
++		if (mismatch) return; // A dirty sentinel-only baseline cannot implicate a nonexistent owner.
++		baselineClean = true;
++		if (committed)
++		{
++			desc.Alignment = 0;
++			hr = Core_Device()->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, ownerState, nullptr, IID_PPV_ARGS(&owner));
++		}
++		else hr = Core_Device()->CreatePlacedResource(heap.Get(), 0, &desc, ownerState, nullptr, IID_PPV_ARGS(&owner));
++		if (FAILED(hr)) { Error("owner-create", "owner allocation failed", hr); return; }
++		if (!CheckSentinel("after-owner-create")) return;
++		if (!committed) Alias(owner.Get());
++		if (!Submit("owner-activate") || !CheckSentinel("after-owner-activate")) return;
++		Upload(owner.Get(), ownerUpload.Get(), ownerFootprint);
++		if (!Submit("owner-upload")) return;
++#ifdef RR_D3D12_TEST_PLACEMENTPROBE
++		if (g_placementProbeFault && !strcmp(name, "adjacent-small"))
++		{
++			// Actual GPU zero of only the first sentinel word, after both healthy baselines.
++			// Its dedicated upload is idle now; no pending command can read the old bytes.
++			void *zeroData = nullptr; const D3D12_RANGE noRead = {0, 0};
++			const HRESULT mapped = sentinelUpload->Map(0, &noRead, &zeroData);
++			if (FAILED(mapped)) { Error("test-negative-copy", "upload Map failed", mapped); return; }
++			memset(static_cast<UINT8 *>(zeroData) + sentinelFootprint.Offset, 0, 4);
++			const D3D12_RANGE zeroWritten = {(SIZE_T)sentinelFootprint.Offset, (SIZE_T)sentinelFootprint.Offset + 4};
++			sentinelUpload->Unmap(0, &zeroWritten);
++			D3D12_TEXTURE_COPY_LOCATION from = {}, to = {};
++			from.pResource = sentinelUpload.Get(); from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++			from.PlacedFootprint = sentinelFootprint;
++			to.pResource = sentinel.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++			const D3D12_BOX word = {0, 0, 0, 1, 1, 1};
++			Core_FlushBarriers(); Core_List()->CopyTextureRegion(&to, 0, 0, 0, &from, &word);
++		}
++#endif
++		if (!CheckSentinel("after-owner-upload")) return;
++		Read(owner.Get(), ownerState, ownerReadback.Get(), ownerFootprint);
++		if (!Submit("owner-readback")) return;
++		std::vector<UINT32> ownerValues;
++		if (!Values(ownerReadback.Get(), ownerFootprint, ownerBytes, ownerValues, "owner-readback")) return;
++		UINT changed = 0, first = UINT_MAX;
++		for (UINT i = 0; i < ownerValues.size(); ++i)
++			if (ownerValues[i] != PlacementPattern(seed + 101, i)) { ++changed; if (first == UINT_MAX) first = i; }
++		Log("placementprobe owner-readback: case=%s copyFence=%llu changed=%u first=%u expected=0x%08x actual=0x%08x result=%s", name,
++			(unsigned long long)lastFence, changed, first, changed ? PlacementPattern(seed + 101, first) : 0,
++			changed ? ownerValues[first] : 0, changed ? "mismatch" : "clean");
++		if (changed) { if (!mismatch) firstFailure = "owner-readback"; mismatch = true; }
++		if (!CheckSentinel("after-owner-readback")) return;
++		Core_Transition(owner.Get(), ownerState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++		ownerState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++		if (!Submit("owner-transition") || !CheckSentinel("after-owner-transition") ||
++			!CheckSentinel("sentinel-repeat-1") || !CheckSentinel("sentinel-repeat-2")) return;
++	}
++};
++void RunPlacementProbe()
++{
++	Log("placementprobe start: private resources; full sentinel and owner copies; two independent readbacks; waits bounded 500 ms each");
++	struct Case { const char *name; UINT width; bool smallPlacement, guarded, committed; };
++	const Case cases[] = {{"adjacent-normal", 256, false, false, false}, {"adjacent-small", 64, true, false, false},
++		{"guarded-normal", 256, false, true, false}, {"guarded-small", 64, true, true, false}, {"committed-control", 256, false, false, true}};
++	UINT clean = 0, mismatch = 0, unavailable = 0;
++	for (UINT i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
++	{
++		const auto &c = cases[i]; PlacementFixture fixture(c.name, i + 1);
++		fixture.Run(c.width, c.smallPlacement, c.guarded, c.committed);
++		const char *result = fixture.unavailable ? "unavailable" : (fixture.mismatch ? "mismatch" : "clean");
++		if (fixture.unavailable) ++unavailable; else if (fixture.mismatch) ++mismatch; else ++clean;
++		Log("placementprobe case end: case=%s result=%s baseline=%s firstFailure=%s lastFence=%llu", c.name, result,
++			fixture.baselineClean ? "clean" : "unestablished", fixture.firstFailure, (unsigned long long)fixture.lastFence);
++		if (Core_DeviceRemoved() || !Core_List()) break;
++	}
++	Log("placementprobe end: clean=%u mismatch=%u unavailable=%u", clean, mismatch, unavailable);
++}
 diff --git a/src/hardware/r_d3d12/d3d12_present.cpp b/src/hardware/r_d3d12/d3d12_present.cpp
 new file mode 100644
 index 0000000..107ba5f
@@ -21325,10 +21629,10 @@ index 0000000..736f77d
 +#endif
 diff --git a/src/hardware/r_d3d12/r_d3d12.cpp b/src/hardware/r_d3d12/r_d3d12.cpp
 new file mode 100644
-index 0000000..1518404
+index 0000000..3b44e89
 --- /dev/null
 +++ b/src/hardware/r_d3d12/r_d3d12.cpp
-@@ -0,0 +1,3163 @@
+@@ -0,0 +1,3178 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// Copyright (C) 2025 by Kart Krew.
@@ -22215,6 +22519,7 @@ index 0000000..1518404
 +	texture.state = state;
 +}
 +#include "d3d12_canaries.inc"
++#include "d3d12_placementprobe.inc"
 +
 +void RetireTexture(GpuTexture &texture)
 +{
@@ -22309,12 +22614,13 @@ index 0000000..1518404
 +		smallPlacement = info.Alignment == D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT && info.SizeInBytes != UINT64_MAX;
 +	}
 +	if (!smallPlacement) { desc.Alignment = 0; info = Core_Device()->GetResourceAllocationInfo(0, 1, &desc); }
-+	// The adjacent canary occupies the existing guard, leaving arena classes unchanged.
++	// Canary runs reserve a sentinel plus a final blind guard; plain runs keep one guard.
 +	constexpr UINT64 kPlacementSlack = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
 +	const UINT64 roundedSize = info.SizeInBytes <= SizeClassArena::MaxClass
 +		? (info.SizeInBytes + kPlacementSlack - 1) & ~(kPlacementSlack - 1) : UINT64_MAX;
-+	const size_t blockBytes = roundedSize <= SizeClassArena::MaxClass - kPlacementSlack
-+		? (size_t)(roundedSize + kPlacementSlack) : 0;
++	const UINT64 trailingBytes = kPlacementSlack * (kTextureCanaries ? 2 : 1);
++	const size_t blockBytes = roundedSize <= SizeClassArena::MaxClass - trailingBytes
++		? (size_t)(roundedSize + trailingBytes) : 0;
 +	if (blockBytes)
 +	{
 +		auto block = g_textureArena.Allocate(blockBytes, (size_t)info.Alignment);
@@ -24492,12 +24798,25 @@ index 0000000..1518404
 +			return UploadCanary(entry.second, true) ? true : false;
 +	return false;
 +}
++
++void D3D12_PlacementProbe_f(void)
++{
++	if (!Core_Device() || !Core_List() || g_deviceLost || g_shutdown || !kTextureCanaries)
++	{
++		Log("placementprobe unavailable: device/list or diagnostic canaries disabled");
++		return;
++	}
++	RunPlacementProbe();
++}
++#ifdef RR_D3D12_TEST_PLACEMENTPROBE
++void D3D12_SetPlacementProbeFaultForTest(boolean enabled) { g_placementProbeFault = enabled != 0; }
++#endif
 diff --git a/src/hardware/r_d3d12/r_d3d12.h b/src/hardware/r_d3d12/r_d3d12.h
 new file mode 100644
-index 0000000..7142d49
+index 0000000..956957f
 --- /dev/null
 +++ b/src/hardware/r_d3d12/r_d3d12.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,76 @@
 +// DR. ROBOTNIK'S RING RACERS
 +//-----------------------------------------------------------------------------
 +// Copyright (C) 2025 by Kart Krew.
@@ -24545,6 +24864,10 @@ index 0000000..7142d49
 +// Diagnostic only: one bounded palette-path readback on the next eligible draw/frame.
 +void D3D12_PaletteProbe_f(void);
 +void D3D12_CanaryCheck_f(void);
++void D3D12_PlacementProbe_f(void);
++#ifdef RR_D3D12_TEST_PLACEMENTPROBE
++void D3D12_SetPlacementProbeFaultForTest(boolean enabled);
++#endif
 +void D3D12_CheckCanariesForTest(void);
 +boolean D3D12_CorruptCanaryForTest(UINT32 ownerId);
 +void D3D12_GetCanaryCountsForTest(UINT64 *live, UINT64 *created, UINT64 *checked, UINT64 *corrupt, UINT64 *fallback);

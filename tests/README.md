@@ -213,6 +213,18 @@ To run one group, use e.g. `ctest --test-dir build/regression -R '^online_' -V`.
 repack used for the palette lookup table is checked for row pitch, slice order and
 untouched padding.
 - **Direct3D 12 palette probe (diagnostic only):** with D3D12 and Palette Rendering on, run `d3d12_paletteprobe` during a scene to request one texture/palette-path snapshot; inspect the consolidated `paletteprobe` log. Upload metadata retains the first opaque RGB ≥253 texel's actual RGBA and coordinate. Every successful texture upload performs that base-mip scan, stopping at the first match or scanning the whole texture if none, even while the command is inactive; only the GPU readback is opt-in, and the Xbox cost of the scan is unmeasured. The GPU readback covers that texel, the R8 Texture3D LUT corner `(63,63,63)`, the screen palette at the CPU LUT corner index, and active light-table rows 0/32 at that column. The complete light table, plus its two white-column colors and column, is retained after successful upload; their expectation is marked unavailable if the current LUT index differs. Exact match fields report mismatches without changing rendering. The request expires at the next frame end or after 4,096 considered draws and can pause for a bounded 500 ms fence wait. `paletteprobe_d3d12` executes extracted production helpers with mocks for resource states, command order, padded footprints, nonzero white columns, near-white selection, inactive requests and failures. The WARP harness invokes the public command before synthetic sprite/floor draws, checks CPU/GPU log values and unchanged pixel oracles, duplicate/repeated requests, unarmed and off/skipped paths, and rejects a corrupted GPU expectation with `--negative-control palette-probe`. GBV validates copy states and restored bindings when run. Windows WARP execution, current-driver validation and the Xbox reproduction remain unrun here; no root cause or fix is claimed.
+- **Direct3D 12 placement probe (diagnostic):** the public `d3d12_placementprobe`
+  runs `adjacent-normal`, `adjacent-small`, `guarded-normal`, `guarded-small`,
+  and `committed-control` against fresh private heaps or committed resources,
+  outside the texture arena and upload ring. Each placed case has a sentinel
+  and a final 4 KB blind tail. Two independent readbacks establish a repeated
+  clean baseline before owner creation, activation, upload and pixel-shader
+  transition; they repeat after each stage. A failure is attributed to the first
+  stage only if its baseline was clean. Each case includes a raw-buffer copy
+  control. The WARP negative control overwrites only the sentinel's first word
+  with a real copy to check detection. Mismatch and unavailable results are not
+  passes. This validates the detector on WARP, not Xbox placement behavior and
+  does not establish a cause or fix for the light-table report.
 - **Extraction safeguards:** ensure comments, strings, nested blocks and prototypes
   do not truncate extracted functions; reject missing/ambiguous definitions.
 

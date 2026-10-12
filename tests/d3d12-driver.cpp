@@ -1124,6 +1124,63 @@ int main(int argc,char **argv) {
             size_t start=logs.size(); D3D12_CheckLightTablesForTest(1.0);
             require(logs.size()==start,"cleared light tables must leave no stale diagnostics");
         }
+        // Isolated API-only placement experiment. The negative really copies one GPU texel.
+        {
+            const size_t start=logs.size();
+            UINT64 liveBefore=0, createdBefore=0, liveAfter=0, createdAfter=0;
+            D3D12_GetCanaryCountsForTest(&liveBefore,&createdBefore,nullptr,nullptr,nullptr);
+            D3D12_SetPlacementProbeFaultForTest(negative=="placement-probe");
+            D3D12_PlacementProbe_f();
+            D3D12_SetPlacementProbeFaultForTest(false);
+            validate(validationQueue);
+            D3D12_GetCanaryCountsForTest(&liveAfter,&createdAfter,nullptr,nullptr,nullptr);
+            if(liveBefore!=liveAfter || createdBefore!=createdAfter)
+                throw std::runtime_error("placement probe mutated the game texture arena");
+            const std::string tail=logs.substr(start);
+            auto line=[&](const std::string &marker) {
+                const size_t at=tail.find(marker);
+                if(at==std::string::npos || tail.find(marker,at+marker.size())!=std::string::npos)
+                    throw std::runtime_error("placement probe stage missing or duplicated");
+                return tail.substr(at,tail.find('\n',at)-at);
+            };
+            const std::array<const char*,5> cases={"adjacent-normal","adjacent-small","guarded-normal","guarded-small","committed-control"};
+            const std::array<const char*,9> stages={"baseline-1","baseline-2","after-owner-create","after-owner-activate",
+                "after-owner-upload","after-owner-readback","after-owner-transition","sentinel-repeat-1","sentinel-repeat-2"};
+            bool oracleMatched=true;
+            for(auto name:cases) {
+                const bool fault=negative=="placement-probe" && !strcmp(name,"adjacent-small");
+                const std::string tag=std::string("case=")+name+" ";
+                if(line("placementprobe raw-buffer-control: "+tag).find("outputs=same result=clean")==std::string::npos ||
+                    line("placementprobe owner-readback: "+tag).find("changed=0 ")==std::string::npos)
+                    throw std::runtime_error("placement probe buffer control or owner upload failed");
+                for(size_t stage=0;stage<stages.size();stage++) {
+                    const std::string check=line("placementprobe check: "+tag+"stage="+stages[stage]+" ");
+                    const bool damaged=fault && stage>=4;
+                    const std::string want=damaged ? "changedA=1 changedB=1 outputs=same" : "changedA=0 changedB=0 outputs=same";
+                    if(check.find(want)==std::string::npos || check.find(damaged?"result=mismatch":"result=clean")==std::string::npos)
+                        throw std::runtime_error("placement probe full-sentinel/two-buffer stage oracle failed");
+                    if(damaged) {
+                        for(char buffer:std::string("AB")) {
+                            const std::string difference=line("placementprobe difference: "+tag+"stage="+stages[stage]+" readback="+buffer+" ");
+                            if(difference.find("first=0 ")==std::string::npos || difference.find("actual=0x00000000")==std::string::npos)
+                                throw std::runtime_error("placement probe fault affected a different sentinel word");
+                        }
+                        oracleMatched=false;
+                    }
+                }
+                const std::string end=line("placementprobe case end: "+tag);
+                if(end.find(fault?"result=mismatch baseline=clean firstFailure=after-owner-upload":"result=clean baseline=clean firstFailure=none")==std::string::npos)
+                    throw std::runtime_error("placement probe first-failure or clean baseline attribution failed");
+            }
+            if(line("placementprobe end: ").find(negative=="placement-probe"?"clean=4 mismatch=1 unavailable=0":"clean=5 mismatch=0 unavailable=0")==std::string::npos)
+                throw std::runtime_error("placement probe clean/unavailable summary failed");
+            // Exercise rendering after all probe submissions, covering state-cache invalidation.
+            reset(); draw({48,80,112}); expect("placement-probe-state",{48,80,112});
+            if(!oracleMatched) {
+                negativeRejected=negative=="placement-probe";
+                throw std::runtime_error("healthy placement probe oracle failed");
+            }
+        }
         // Placed-texture padding canaries: production GPU writes/copies and fence-delayed readback.
         // Keep these after perf accounting; the negative corrupts exactly the middle live owner.
         {
