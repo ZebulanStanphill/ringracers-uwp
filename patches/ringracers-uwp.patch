@@ -1,4 +1,4 @@
-From 145cec98f75b0b6820e01dd1c5906d3f2e9dad90 Mon Sep 17 00:00:00 2001
+From a5f12d9d59e5bfb83108a7b1f0ea3970b40857ab Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -697,6 +697,14 @@ Agent: Codex (/root/isolation_host, implementation and checks)
 Model: gpt-6.1-sol
 Agent: Codex (/root/isolation_export, commit preparation)
 Model: gpt-6-luna
+
+- [UWP]: Make the standalone isolation app's default run a one-pass characterisation of the Xbox placed-texture state-word defect: a self-contained, commented minimal repro on its own device (a 64 KB buffer adjacent to a placed 256x256 texture in a CUSTOM and a DEFAULT heap, checked after creation and fenced transitions), a byte-level map suite that classifies every DWORD the driver changes before, inside and after each placed resource through an aliased CPU window over 29 texture/buffer cases and every GPU step, committed and placed CPU-visible texture tests with a default-heap upload-source check, and a four-variant copy-ordering test. The 408-case matrix stays behind a legacy option. Add a CPU injection self-test for the map suite. Engine renderer source is unchanged.
+
+Agent: Claude Code (Opus 5.5)
+Model: claude-opus-5-5
+Agent: Claude Code (Sonnet 5.5)
+Model: claude-sonnet-5-5
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  CMakeLists.txt                                |   19 +-
  CMakePresets.json                             |   17 +
@@ -753,8 +761,9 @@ Model: gpt-6-luna
  src/hardware/r_d3d12/d3d12_screens.inc        |  580 ++
  src/hardware/r_d3d12/d3d12_upload.cpp         |  112 +
  src/hardware/r_d3d12/d3d12_upload.h           |   54 +
- src/hardware/r_d3d12/isolation/isolation.cpp  |  456 ++
- src/hardware/r_d3d12/isolation/isolation.h    |   17 +
+ src/hardware/r_d3d12/isolation/isolation.cpp  |  807 +++
+ src/hardware/r_d3d12/isolation/isolation.h    |   32 +
+ .../r_d3d12/isolation/minimal_repro.cpp       |  624 ++
  src/hardware/r_d3d12/isolation/observe.hlsl   |   18 +
  src/hardware/r_d3d12/mips.h                   |   60 +
  src/hardware/r_d3d12/pipeline_key.h           |   51 +
@@ -816,7 +825,7 @@ Model: gpt-6-luna
  src/w_wad.cpp                                 |  312 +
  src/w_wad.h                                   |   11 +
  src/z_zone.cpp                                |    5 +
- 118 files changed, 25363 insertions(+), 1137 deletions(-)
+ 119 files changed, 26353 insertions(+), 1137 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -847,6 +856,7 @@ Model: gpt-6-luna
  create mode 100644 src/hardware/r_d3d12/d3d12_upload.h
  create mode 100644 src/hardware/r_d3d12/isolation/isolation.cpp
  create mode 100644 src/hardware/r_d3d12/isolation/isolation.h
+ create mode 100644 src/hardware/r_d3d12/isolation/minimal_repro.cpp
  create mode 100644 src/hardware/r_d3d12/isolation/observe.hlsl
  create mode 100644 src/hardware/r_d3d12/mips.h
  create mode 100644 src/hardware/r_d3d12/pipeline_key.h
@@ -21541,10 +21551,10 @@ index 0000000..4171b1c
 +#endif
 diff --git a/src/hardware/r_d3d12/isolation/isolation.cpp b/src/hardware/r_d3d12/isolation/isolation.cpp
 new file mode 100644
-index 0000000..3be64f0
+index 0000000..62cd69e
 --- /dev/null
 +++ b/src/hardware/r_d3d12/isolation/isolation.cpp
-@@ -0,0 +1,456 @@
+@@ -0,0 +1,807 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// Windows SDK and C++ standard library only. Each invocation owns a fresh device.
 +#include "isolation.h"
@@ -21590,6 +21600,8 @@ index 0000000..3be64f0
 + case D3D12_RESOURCE_STATE_COPY_SOURCE:return "COPY_SOURCE";
 + case D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE:return "PIXEL_SHADER_RESOURCE";
 + case D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE:return "NON_PIXEL_SHADER_RESOURCE";
++ case D3D12_RESOURCE_STATE_RENDER_TARGET:return "RENDER_TARGET";
++ case D3D12_RESOURCE_STATE_UNORDERED_ACCESS:return "UNORDERED_ACCESS";
 + default:return "OTHER"; }
 +}
 +const char* formatName(DXGI_FORMAT f) { return f==DXGI_FORMAT_R8_UNORM?"R8":f==DXGI_FORMAT_R32_UINT?"R32_UINT":"RGBA8"; }
@@ -21610,7 +21622,7 @@ index 0000000..3be64f0
 + ComPtr<ID3D12InfoQueue> info; ComPtr<ID3D12RootSignature> root;
 + ComPtr<ID3D12PipelineState> bytesPSO,uintPSO;
 + HANDLE event=nullptr; U64 serial=0; bool recording=false,fatal=false,compute=false;
-+ bool coherent=false,tier2=false; UINT descriptorSize=0;
++ bool coherent=false,tier2=false,logFences=true; UINT descriptorSize=0;
 + // Retain every GPU object until the device is idle. On fatal timeout, Run leaks
 + // this entire context deliberately; objects referenced by pending work survive.
 + std::vector<ComPtr<IUnknown>> retained;
@@ -21641,7 +21653,7 @@ index 0000000..3be64f0
 + }
 + if(fence->GetCompletedValue()==UINT64_MAX || FAILED(device->GetDeviceRemovedReason())) {
 + checked(DXGI_ERROR_DEVICE_REMOVED,"Fence/device removal"); return false; }
-+ log("FENCE phase=%s value=%llu complete=%llu",phase,serial,fence->GetCompletedValue());
++ if(logFences)log("FENCE phase=%s value=%llu complete=%llu",phase,serial,fence->GetCompletedValue());
 + inspectDebug();return true;
 + }
 + void inspectDebug() { if(!info)return;
@@ -21973,8 +21985,333 @@ index 0000000..3be64f0
 + }
 + if(!c.fatal){D3D12_RANGE written={0,65536};sentinel->Unmap(0,&written);}c.inspectDebug();finish();
 +}
++// ---------------------------------------------------------------------------------
++// Default suite: [B] byte-level map of everything the driver writes around a placed
++// resource, [C] committed CPU-visible texture, [D] copy ordering.
++// ---------------------------------------------------------------------------------
++constexpr UINT TexelMul=0x9e3779b1u, TexelAdd=0x2545f491u, WindowMul=0x85ebca6bu;
++UINT mulInverse(UINT a) { UINT x=a; for(int i=0;i<5;++i)x*=2u-a*x; return x; }
++// Upload data is built from unique marker words (top bit set; the low 31 bits are a
++// bijection of the DWORD id), so a DWORD found anywhere in the window names its origin.
++UINT idWord(U64 id) { return 0x80000000u|(((UINT)id*TexelMul+TexelAdd)&0x7fffffffu); }
++U64 idOf(UINT v) { static const UINT inverse=mulInverse(TexelMul); return ((v&0x7fffffffu)-TexelAdd)*inverse&0x7fffffffu; }
++// Window pattern: top bit clear (never a marker word) and never 0 or 1, the values seen so far.
++UINT windowWord(size_t i) { UINT v=((UINT)i*WindowMul^0x5bd1e995u)&0x7fffffffu; return v<2?v+0x40000000u:v; }
++bool cpuVisibleHeaps(Context&c) { return c.tier2&&(c.coherent||c.options.warp); }
++// Hardware must offer exactly WRITE_BACK/L0 (the memory the defect was seen in); WARP, the CI reference,
++// may report other CPU-visible properties but behaves the same functionally.
++bool usableCustomHeap(Context&c,const D3D12_HEAP_PROPERTIES&p) {
++ if(p.Type!=D3D12_HEAP_TYPE_CUSTOM)return false;
++ return c.options.warp||(p.CPUPageProperty==D3D12_CPU_PAGE_PROPERTY_WRITE_BACK&&p.MemoryPoolPreference==D3D12_MEMORY_POOL_L0);
++}
++ComPtr<ID3D12Resource> qbuf(Context&c,U64 size,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state) {
++ ComPtr<ID3D12Resource> r; auto p=props(type); auto d=buffer(size);
++ if(c.checked(c.device->CreateCommittedResource(&p,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&r)),"CreateCommittedResource(buffer)"))c.keep(r);
++ return r;
++}
++bool qfill(Context&c,ID3D12Resource*r,const std::vector<unsigned char>& data) {
++ void*p=nullptr; D3D12_RANGE none={0,0};
++ if(!c.checked(r->Map(0,&none,&p),"Upload.Map"))return false;
++ memcpy(p,data.data(),data.size()); D3D12_RANGE wrote={0,data.size()}; r->Unmap(0,&wrote); return true;
++}
++struct MapCase {
++ const char*name="canonical"; D3D12_RESOURCE_DIMENSION dim=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++ UINT w=256,h=256,depth=1,mips=1; DXGI_FORMAT format=DXGI_FORMAT_R8G8B8A8_UNORM;
++ D3D12_RESOURCE_FLAGS flags=D3D12_RESOURCE_FLAG_NONE; U64 alignment=0,offset=65536; bool control=false;
++};
++struct FormatInfo { const char*name; UINT elemBytes,block; };
++FormatInfo formatInfo(DXGI_FORMAT f) {
++ switch(f) { case DXGI_FORMAT_R8_UNORM:return {"R8",1,1}; case DXGI_FORMAT_R32_UINT:return {"R32_UINT",4,1};
++ case DXGI_FORMAT_R16G16B16A16_FLOAT:return {"RGBA16F",8,1}; case DXGI_FORMAT_BC1_UNORM:return {"BC1",8,4};
++ default:return {"RGBA8",4,1}; }
++}
++const char* dimName(const MapCase&m) {
++ if(m.control)return "BUFFER";
++ return m.dim==D3D12_RESOURCE_DIMENSION_TEXTURE1D?"1D":m.dim==D3D12_RESOURCE_DIMENSION_TEXTURE3D?"3D":"2D";
++}
++UINT mipCount(UINT w,UINT h) { UINT n=1; for(UINT m=std::max(w,h);m>1;m>>=1)++n; return n; }
++D3D12_RESOURCE_DESC mapDesc(const MapCase&m) {
++ if(m.control)return buffer(262144);
++ D3D12_RESOURCE_DESC d={}; d.Dimension=m.dim; d.Alignment=m.alignment; d.Width=m.w;
++ d.Height=m.dim==D3D12_RESOURCE_DIMENSION_TEXTURE1D?1:m.h; d.DepthOrArraySize=(UINT16)m.depth; d.MipLevels=(UINT16)m.mips;
++ d.Format=m.format; d.SampleDesc.Count=1; d.Flags=m.flags; return d;
++}
++const long long NoRel=LLONG_MIN;
++const char* relText(long long v,char*buf) { if(v==NoRel)return "none"; snprintf(buf,32,"%lld",v); return buf; }
++// One map-suite case. The "window" is a ROW_MAJOR buffer over the whole CUSTOM heap that is only
++// ever read by the CPU; the texture under test is placed inside it at offset O.
++struct MapRun {
++ Context&c; const MapCase&m; UINT id;
++ D3D12_RESOURCE_DESC desc={}; U64 O=0,S=0,H=0,total=0,totalIds=0; size_t words=0; volatile UINT*w=nullptr;
++ std::vector<UINT> prev,cur;
++ std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> fps; std::vector<UINT> rows; std::vector<U64> rowSizes;
++ std::vector<U64> idBase,idCount; bool unique=false,injected=false;
++ std::vector<unsigned char> uploadData;
++ ComPtr<ID3D12Heap> heap; ComPtr<ID3D12Resource> window,tex,upload; ComPtr<ID3D12DescriptorHeap> rtvHeap;
++ D3D12_RESOURCE_STATES state=D3D12_RESOURCE_STATE_COMMON; unsigned outsideSteps=0;
++ MapRun(Context&ctx,const MapCase&mc,UINT i):c(ctx),m(mc),id(i){}
++ bool unavailable(const char*why,HRESULT hr=S_OK) {
++ c.log("MAP_UNAVAILABLE id=%u reason=%s hr=0x%08lx",id,why,(unsigned long)hr); return false; }
++ void snapshot() { MemoryBarrier(); for(size_t i=0;i<words;++i)cur[i]=w[i]; }
++ // Builds upload data in which every DWORD of every subresource carries a unique id.
++ void buildUpload() {
++ if(m.control) { unique=true; totalIds=S/4; idBase={0}; idCount={totalIds}; uploadData.assign((size_t)S,0);
++ for(U64 k=0;k<totalIds;++k){UINT v=idWord(k);memcpy(&uploadData[(size_t)k*4],&v,4);} total=S; return; }
++ auto fi=formatInfo(m.format); unique=fi.elemBytes%4==0; uploadData.assign((size_t)total,0);
++ U64 running=0; UINT dw=fi.elemBytes/4;
++ for(size_t s=0;s<fps.size();++s) {
++ const auto&fp=fps[s]; U64 depthN=fp.Footprint.Depth,rowsN=rows[s],perRow=rowSizes[s]/fi.elemBytes;
++ idBase.push_back(running); idCount.push_back(unique?depthN*rowsN*perRow*dw:0);
++ for(U64 z=0;z<depthN;++z)for(U64 y=0;y<rowsN;++y)for(U64 x=0;x<perRow;++x) {
++ U64 at=fp.Offset+(z*rowsN+y)*fp.Footprint.RowPitch+x*fi.elemBytes,index=(z*rowsN+y)*perRow+x;
++ if(unique)for(UINT j=0;j<dw;++j){UINT v=idWord(running+index*dw+j);memcpy(&uploadData[(size_t)at+j*4],&v,4);}
++ else for(UINT j=0;j<fi.elemBytes;++j)uploadData[(size_t)at+j]=(unsigned char)(0x80|((index*37+s+j)&0x7f));
++ }
++ running+=idCount.back();
++ }
++ totalIds=running;
++ }
++ void layout() {
++ std::vector<long long> loc((size_t)totalIds,NoRel); U64 duplicates=0,missing=0;
++ for(size_t i=0;i<words;++i) { UINT v=cur[i]; if(!(v&0x80000000u))continue; U64 k=idOf(v);
++ if(k<totalIds){ if(loc[(size_t)k]!=NoRel)++duplicates; loc[(size_t)k]=(long long)(i*4)-(long long)O; } }
++ for(size_t s=0;s<idBase.size();++s) {
++ long long mn=NoRel,mx=NoRel;
++ for(U64 k=idBase[s];k<idBase[s]+idCount[s];++k) { long long r=loc[(size_t)k]; if(r==NoRel){++missing;continue;}
++ if(mn==NoRel||r<mn)mn=r; if(mx==NoRel||r>mx)mx=r; }
++ char b0[32],b1[32],b2[32],b3[32]; long long firstRel=idCount[s]?loc[(size_t)idBase[s]]:NoRel,lastRel=idCount[s]?loc[(size_t)(idBase[s]+idCount[s]-1)]:NoRel;
++ c.log("MAP_LAYOUT id=%u subresource=%u firstTexelRel=%s lastTexelRel=%s minRel=%s maxRel=%s",id,(UINT)s,relText(firstRel,b0),relText(lastRel,b1),relText(mn,b2),relText(mx,b3));
++ }
++ if(missing)c.log("MAP_LAYOUT_MISSING id=%u count=%llu",id,missing);
++ if(duplicates)c.log("MAP_LAYOUT_DUPLICATE id=%u count=%llu",id,duplicates);
++ }
++ // Classifies every DWORD that differs from the previous snapshot.
++ void analyze(const char*step,bool isUpload) {
++ const size_t first=(size_t)(O/4),last=(size_t)((O+S+3)/4);
++ unsigned nb=0,ni=0,na=0; long long insideFirst=-1,insideLast=-1,afterFirst=-1; std::vector<size_t> outside,inside;
++ for(size_t i=0;i<words;++i) { if(cur[i]==prev[i])continue; long long rel=(long long)(i*4)-(long long)O;
++ if(i<first){++nb;outside.push_back(i);}
++ else if(i<last){++ni;if(insideFirst<0)insideFirst=rel;insideLast=rel;if(!isUpload)inside.push_back(i);}
++ else{++na;if(afterFirst<0)afterFirst=rel;outside.push_back(i);} }
++ c.log("MAP_STEP id=%u step=%s before=%u inside=%u after=%u insideFirstRel=%lld insideLastRel=%lld afterFirstRel=%lld",id,step,nb,ni,na,insideFirst,insideLast,afterFirst);
++ unsigned printed=0; auto emit=[&](size_t i) { if(printed>=64)return; long long rel=(long long)(i*4)-(long long)O;
++ c.log("MAP_WORD id=%u step=%s rel=%lld relEnd=%lld old=%08x new=%08x",id,step,rel,rel-(long long)S,prev[i],cur[i]); ++printed; };
++ for(size_t i:outside)emit(i); for(size_t i:inside)emit(i);
++ if(outside.size()+inside.size()>64)c.log("MAP_WORD_CAP id=%u step=%s cap=64 listable=%llu",id,step,(U64)(outside.size()+inside.size()));
++ if(nb+na)++outsideSteps;
++ if(injected&&!strcmp(step,"activate")) {
++ size_t at=(size_t)((O+S)/4);
++ if(nb==0&&na==1&&outside.size()==1&&outside[0]==at&&cur[at]==0)++c.result.injectionsDetected;
++ else{++c.result.selfTestsFailed;c.log("SELF_TEST_FAIL name=map-outside-injection id=%u expectedRel=%llu",id,S);}
++ }
++ if(isUpload&&unique)layout();
++ std::swap(prev,cur);
++ }
++ template<class F> bool gpu(const char*phase,F body) {
++ if(!c.begin())return false; body(); if(!c.submit(phase))return false;
++ snapshot(); analyze(phase,!strcmp(phase,"upload")); return true; // the snapshot precedes all logging for the step
++ }
++ bool to(D3D12_RESOURCE_STATES next,const char*name) { return gpu(name,[&]{c.transition(tex.Get(),state,next);state=next;}); }
++ bool run();
++};
++bool MapRun::run() {
++ desc=mapDesc(m); O=m.offset; auto fi=formatInfo(m.format);
++ c.log("MAP_CASE id=%u name=%s dim=%s width=%llu height=%u depthOrArray=%u mips=%u format=%s flags=%u requestedAlignment=%llu offset=%llu",
++ id,m.name,dimName(m),(U64)desc.Width,m.control?1u:desc.Height,m.control?1u:m.depth,m.control?1u:m.mips,m.control?"BUFFER":fi.name,(UINT)m.flags,m.alignment,O);
++ auto info=c.device->GetResourceAllocationInfo(0,1,&desc);
++ if(info.SizeInBytes==UINT64_MAX)return unavailable("GetResourceAllocationInfo");
++ S=info.SizeInBytes;
++ if(info.Alignment&&O%info.Alignment)return unavailable("offset-not-aligned");
++ auto explicitDesc=desc; explicitDesc.Alignment=65536; auto explicitInfo=c.device->GetResourceAllocationInfo(0,1,&explicitDesc);
++ if(!m.control) {
++ UINT subs=m.dim==D3D12_RESOURCE_DIMENSION_TEXTURE3D?m.mips:m.mips*m.depth;
++ fps.resize(subs);rows.resize(subs);rowSizes.resize(subs);
++ c.device->GetCopyableFootprints(&desc,0,subs,0,fps.data(),rows.data(),rowSizes.data(),&total);
++ } else total=S;
++ char o0[32]="unavailable",o1[32]="unavailable",ot[32]="unavailable";
++#if defined(__ID3D12Device4_INTERFACE_DEFINED__)
++ { ComPtr<ID3D12Device4> device4;
++ if(SUCCEEDED(c.device.As(&device4))) { D3D12_RESOURCE_DESC two[2]={desc,desc}; D3D12_RESOURCE_ALLOCATION_INFO1 one[2]={};
++ auto all=device4->GetResourceAllocationInfo1(0,2,two,one);
++ snprintf(o0,sizeof(o0),"%llu",one[0].Offset);snprintf(o1,sizeof(o1),"%llu",one[1].Offset);snprintf(ot,sizeof(ot),"%llu",all.SizeInBytes); } }
++#endif
++ c.log("MAP_ALLOC id=%u size=%llu alignment=%llu explicitAlign64KSize=%llu copyableTotal=%llu info1_offset0=%s info1_offset1=%s info1_total=%s",id,S,info.Alignment,explicitInfo.SizeInBytes,total,o0,o1,ot);
++ buildUpload();
++ upload=qbuf(c,total,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
++ if(!upload||!qfill(c,upload.Get(),uploadData))return false;
++ bool renderTarget=(m.flags&D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)!=0,unordered=(m.flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)!=0;
++ if(renderTarget) { D3D12_DESCRIPTOR_HEAP_DESC hd={};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=1;
++ if(!c.checked(c.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvHeap)),"CreateDescriptorHeap(RTV)"))return false; c.keep(rtvHeap); }
++ auto custom=c.device->GetCustomHeapProperties(0,D3D12_HEAP_TYPE_UPLOAD);
++ if(!usableCustomHeap(c,custom))return unavailable("no-write-back-L0-custom-heap");
++ H=align(O+S+131072,65536); words=(size_t)(H/4);
++ D3D12_HEAP_DESC hd={}; hd.SizeInBytes=H; hd.Properties=custom; hd.Alignment=65536; hd.Flags=D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
++ HRESULT hr=c.device->CreateHeap(&hd,IID_PPV_ARGS(&heap)); if(FAILED(hr))return unavailable("CreateHeap",hr); c.keep(heap);
++ auto wd=buffer(H); hr=c.device->CreatePlacedResource(heap.Get(),0,&wd,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&window));
++ if(FAILED(hr))return unavailable("CreatePlacedResource(window)",hr); c.keep(window);
++ if(!c.begin())return false; c.activate(window.Get()); if(!c.submit("map-window-activate"))return false;
++ void*mapped=nullptr; hr=window->Map(0,nullptr,&mapped); if(FAILED(hr)||!mapped)return unavailable("Map(window)",hr);
++ w=static_cast<volatile UINT*>(mapped); prev.assign(words,0); cur.assign(words,0);
++ for(size_t i=0;i<words;++i)w[i]=windowWord(i);
++ snapshot(); size_t wrong=0; for(size_t i=0;i<words;++i)if(cur[i]!=windowWord(i))++wrong;
++ if(wrong){++c.result.selfTestsFailed;c.log("SELF_TEST_FAIL name=map-window-readback id=%u wrongWords=%llu",id,(U64)wrong);}
++ std::swap(prev,cur);
++ c.log("MAP_WINDOW id=%u heapSize=%llu windowWords=%llu textureRange=[%llu,%llu) pattern=windowWord(i)",id,H,(U64)words,O,O+S);
++ // Create, then snapshot immediately: nothing is logged or submitted in between.
++ hr=c.device->CreatePlacedResource(heap.Get(),O,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&tex));
++ snapshot();
++ if(FAILED(hr)) { if(FAILED(c.device->GetDeviceRemovedReason()))c.checked(c.device->GetDeviceRemovedReason(),"CreatePlacedResource/device removed"); return unavailable("CreatePlacedResource(test)",hr); }
++ c.keep(tex); analyze("create",false);
++ if(c.options.injection==Injection::MapOutsideWord) {
++ size_t at=(size_t)((O+S)/4); UINT old=w[at]; w[at]=0; MemoryBarrier(); injected=true; ++c.result.injectionsAttempted;
++ c.log("MAP_INJECTION id=%u rel=%llu old=%08x new=00000000",id,S,old);
++ }
++ bool ok=gpu("activate",[&]{c.activate(tex.Get());}) && to(D3D12_RESOURCE_STATE_COPY_DEST,"to_COPY_DEST") &&
++ gpu("upload",[&]{
++ if(m.control)c.list->CopyBufferRegion(tex.Get(),0,upload.Get(),0,S);
++ else for(UINT s=0;s<fps.size();++s){D3D12_TEXTURE_COPY_LOCATION src={},dst={};src.pResource=upload.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;src.PlacedFootprint=fps[s];
++ dst.pResource=tex.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;dst.SubresourceIndex=s;c.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);} }) &&
++ to(D3D12_RESOURCE_STATE_COPY_SOURCE,"to_COPY_SOURCE") && to(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,"to_PIXEL_SHADER_RESOURCE");
++ if(ok&&renderTarget)ok=to(D3D12_RESOURCE_STATE_RENDER_TARGET,"to_RENDER_TARGET") && gpu("clear_rtv",[&]{
++ auto handle=rtvHeap->GetCPUDescriptorHandleForHeapStart(); c.device->CreateRenderTargetView(tex.Get(),nullptr,handle);
++ const float color[4]={0.25f,0.5f,0.75f,1.0f}; c.list->ClearRenderTargetView(handle,color,0,nullptr); });
++ if(ok&&unordered)ok=to(D3D12_RESOURCE_STATE_UNORDERED_ACCESS,"to_UNORDERED_ACCESS");
++ if(ok)ok=to(D3D12_RESOURCE_STATE_COPY_DEST,"to_COPY_DEST_2") && to(D3D12_RESOURCE_STATE_COMMON,"to_COMMON");
++ if(ok) { forget(c,tex.Get()); tex.Reset(); snapshot(); analyze("release",false); }
++ size_t first=(size_t)(O/4),last=(size_t)((O+S+3)/4),differs=0;
++ for(size_t i=0;i<words;++i)if((i<first||i>=last)&&prev[i]!=windowWord(i))++differs;
++ c.log("MAP_CASE_END id=%u complete=%u outsideChangedVsOriginal=%llu stepsWithOutsideWrites=%u",id,ok,(U64)differs,outsideSteps);
++ if(!c.fatal)window->Unmap(0,nullptr);
++ return true;
++}
++std::vector<MapCase> mapMatrix(bool quick) {
++ std::vector<MapCase> v; MapCase x;
++ x.name="canonical-run1"; v.push_back(x);
++ if(!quick) { x.name="canonical-run2"; v.push_back(x); x.name="canonical-run3"; v.push_back(x); }
++ auto d2=[&](const char*name,UINT width,UINT height,bool smallAlignment=false,bool chain=false) { MapCase y; y.name=name; y.w=width; y.h=height;
++ y.alignment=smallAlignment?4096:0; y.mips=chain?mipCount(width,height):1; return y; };
++ if(!quick) {
++ v.push_back(d2("4x4-small",4,4,true)); v.push_back(d2("32x32-small",32,32,true)); v.push_back(d2("64x64-small",64,64,true));
++ v.push_back(d2("64x64",64,64)); v.push_back(d2("128x128",128,128)); v.push_back(d2("256x33",256,33)); v.push_back(d2("512x512",512,512));
++ v.push_back(d2("1024x1024",1024,1024)); v.push_back(d2("1000x750",1000,750)); v.push_back(d2("2048x16",2048,16)); v.push_back(d2("16x2048",16,2048));
++ v.push_back(d2("256x256-mips",256,256,false,true)); v.push_back(d2("1024x1024-mips",1024,1024,false,true)); v.push_back(d2("1000x750-mips",1000,750,false,true));
++ MapCase f=d2("256x256-R8",256,256); f.format=DXGI_FORMAT_R8_UNORM; v.push_back(f);
++ f=d2("256x256-R32_UINT",256,256); f.format=DXGI_FORMAT_R32_UINT; v.push_back(f);
++ f=d2("256x256-RGBA16F",256,256); f.format=DXGI_FORMAT_R16G16B16A16_FLOAT; v.push_back(f);
++ f=d2("256x256-BC1",256,256); f.format=DXGI_FORMAT_BC1_UNORM; v.push_back(f);
++ f=d2("256x256-render-target",256,256); f.flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET; v.push_back(f);
++ f=d2("256x256-unordered-access",256,256); f.flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS; v.push_back(f);
++ f=d2("1D-4096",4096,1); f.dim=D3D12_RESOURCE_DIMENSION_TEXTURE1D; v.push_back(f);
++ f=d2("2D-array-256x256x4",256,256); f.depth=4; v.push_back(f);
++ f=d2("3D-32x32x32",32,32); f.dim=D3D12_RESOURCE_DIMENSION_TEXTURE3D; f.depth=32; v.push_back(f);
++ f=d2("canonical-offset-131072",256,256); f.offset=131072; v.push_back(f);
++ f=d2("canonical-offset-1048576",256,256); f.offset=1048576; v.push_back(f);
++ }
++ MapCase control; control.name="control-buffer-262144"; control.control=true; control.dim=D3D12_RESOURCE_DIMENSION_BUFFER; v.push_back(control);
++ return v;
++}
++void runMapSuite(Context&c) {
++ auto cases=mapMatrix(c.options.quick); UINT id=0;
++ c.log("MAP_BEGIN cases=%u quick=%u window=aliased-ROW_MAJOR-buffer-over-whole-CUSTOM-heap",(UINT)cases.size(),c.options.quick);
++ if(!cpuVisibleHeaps(c)) { c.log("MAP_UNAVAILABLE id=0 reason=requires-cache-coherent-UMA-and-resource-heap-tier-2 hr=0x00000000"); c.result.unavailableCases+=(UINT)cases.size(); return; }
++ for(const auto&x:cases) {
++ if(c.fatal)break; MapRun run(c,x,++id);
++ if(!run.run()) { ++c.result.unavailableCases; c.log("MAP_CASE_END id=%u complete=0 unavailable=1",id); }
++ else { ++c.result.casesCompleted; ++c.result.mapCasesRun; if(run.outsideSteps)++c.result.mapCasesWithOutsideWrites; }
++ if(!c.fatal)c.retained.clear();
++ }
++}
++// [C] Committed (and, for comparison, placed) texture in CPU-visible memory.
++void committedCpuCase(Context&c,bool placed) {
++ const char*label=placed?"placed":"committed";
++ auto unavailable=[&](const char*why,HRESULT hr){ c.log("COMMITTED_CPU_UNAVAILABLE placement=%s reason=%s hr=0x%08lx",label,why,(unsigned long)hr); ++c.result.unavailableCases; };
++ if(!cpuVisibleHeaps(c)) { unavailable("requires-cache-coherent-UMA-and-resource-heap-tier-2",S_OK); return; }
++ auto custom=c.device->GetCustomHeapProperties(0,D3D12_HEAP_TYPE_UPLOAD);
++ if(!usableCustomHeap(c,custom)) { unavailable("no-write-back-L0-custom-heap",S_OK); return; }
++ auto desc=texture(256,256,DXGI_FORMAT_R8G8B8A8_UNORM,false); ComPtr<ID3D12Heap> heap; ComPtr<ID3D12Resource> r; HRESULT hr;
++ if(placed) { auto info=c.device->GetResourceAllocationInfo(0,1,&desc); D3D12_HEAP_DESC hd={}; hd.SizeInBytes=align(info.SizeInBytes,65536); hd.Properties=custom; hd.Alignment=65536; hd.Flags=D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
++ hr=c.device->CreateHeap(&hd,IID_PPV_ARGS(&heap)); if(SUCCEEDED(hr)){c.keep(heap);hr=c.device->CreatePlacedResource(heap.Get(),0,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&r));} }
++ else hr=c.device->CreateCommittedResource(&custom,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&r));
++ if(FAILED(hr)) { unavailable("texture-creation",hr); return; }
++ c.keep(r);
++ if(placed){ if(!c.begin())return; c.activate(r.Get()); if(!c.submit("committed-cpu-placed-activate"))return; }
++ hr=r->Map(0,nullptr,nullptr); if(FAILED(hr)) { unavailable("Map(texture)",hr); return; }
++ const UINT count=256*256,pitch=256*4,slice=pitch*256; std::vector<UINT> expected(count),got(count);
++ for(UINT i=0;i<count;++i)expected[i]=word(i,DXGI_FORMAT_R8G8B8A8_UNORM);
++ hr=r->WriteToSubresource(0,nullptr,expected.data(),pitch,slice);
++ if(FAILED(hr)) { unavailable("WriteToSubresource",hr); r->Unmap(0,nullptr); return; }
++ auto check=[&](const char*step) {
++ std::fill(got.begin(),got.end(),0xdeadbeefu); HRESULT rh=r->ReadFromSubresource(got.data(),pitch,slice,0,nullptr);
++ if(FAILED(rh)){c.log("COMMITTED_CPU_UNAVAILABLE placement=%s reason=ReadFromSubresource step=%s hr=0x%08lx",label,step,(unsigned long)rh);return false;}
++ UINT changed=0,first=UINT_MAX,last=0; for(UINT i=0;i<count;++i)if(got[i]!=expected[i]){if(first==UINT_MAX)first=i;last=i;++changed;}
++ c.log("COMMITTED_CPU placement=%s step=%s changedTexels=%u firstIndex=%d lastIndex=%d",label,step,changed,changed?(int)first:-1,changed?(int)last:-1);
++ UINT printed=0; for(UINT i=0;i<count&&printed<16;++i)if(got[i]!=expected[i]){c.log("COMMITTED_CPU_TEXEL placement=%s step=%s index=%u x=%u y=%u expected=%08x actual=%08x",label,step,i,i%256,i/256,expected[i],got[i]);++printed;}
++ c.result.committedCpuChanged+=changed; return true;
++ };
++ bool ok=check("after_write"); auto state=D3D12_RESOURCE_STATE_COMMON;
++ const struct { D3D12_RESOURCE_STATES next; const char*name; } steps[]={{D3D12_RESOURCE_STATE_COPY_DEST,"to_COPY_DEST"},{D3D12_RESOURCE_STATE_COPY_SOURCE,"to_COPY_SOURCE"},
++ {D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,"to_PIXEL_SHADER_RESOURCE"},{D3D12_RESOURCE_STATE_COPY_DEST,"to_COPY_DEST_2"},{D3D12_RESOURCE_STATE_COMMON,"to_COMMON"}};
++ for(const auto&s:steps) { if(!ok||c.fatal)break; if(!c.begin())break; c.transition(r.Get(),state,s.next); state=s.next; if(!c.submit(s.name))break; ok=check(s.name); }
++ if(!c.fatal)r->Unmap(0,nullptr);
++}
++// [C] Default-heap committed control: is the destination or the upload source damaged?
++void committedDefaultCase(Context&c) {
++ auto desc=texture(256,256,DXGI_FORMAT_R8G8B8A8_UNORM,false); D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp={}; UINT rowsN=0; U64 rowSize=0,total=0;
++ c.device->GetCopyableFootprints(&desc,0,1,0,&fp,&rowsN,&rowSize,&total);
++ const UINT count=256*256; std::vector<unsigned char> staging((size_t)total,0); std::vector<UINT> expected(count);
++ for(UINT i=0;i<count;++i){expected[i]=word(i,DXGI_FORMAT_R8G8B8A8_UNORM);memcpy(&staging[(size_t)fp.Offset+(i/256)*fp.Footprint.RowPitch+(i%256)*4],&expected[i],4);}
++ auto upload=qbuf(c,total,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ), readback=qbuf(c,total,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
++ if(!upload||!readback||!qfill(c,upload.Get(),staging))return;
++ ComPtr<ID3D12Resource> tex; auto heap=props(D3D12_HEAP_TYPE_DEFAULT);
++ if(!c.checked(c.device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&tex)),"CreateCommittedResource(default texture)"))return;
++ c.keep(tex);
++ D3D12_TEXTURE_COPY_LOCATION image={}; image.pResource=tex.Get(); image.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++ D3D12_TEXTURE_COPY_LOCATION buf={}; buf.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; buf.PlacedFootprint=fp;
++ if(!c.begin())return; c.transition(tex.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
++ buf.pResource=upload.Get(); c.list->CopyTextureRegion(&image,0,0,0,&buf,nullptr); if(!c.submit("committed-default-upload"))return;
++ std::vector<unsigned char> sourceAfterUpload,sourceFinal,result; if(!c.read(upload.Get(),total,sourceAfterUpload))return;
++ if(!c.begin())return; c.transition(tex.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE);
++ buf.pResource=readback.Get(); c.list->CopyTextureRegion(&buf,0,0,0,&image,nullptr); if(!c.submit("committed-default-readback"))return;
++ if(!c.read(readback.Get(),total,result)||!c.read(upload.Get(),total,sourceFinal))return;
++ bool intact1=sourceAfterUpload==staging,intact2=sourceFinal==staging; UINT changed=0; int first=-1; UINT lastActual=0,uploadLast=0;
++ for(UINT i=0;i<count;++i){UINT v=0;memcpy(&v,&result[(size_t)fp.Offset+(i/256)*fp.Footprint.RowPitch+(i%256)*4],4);if(v!=expected[i]){if(first<0)first=(int)i;++changed;}if(i==count-1)lastActual=v;}
++ memcpy(&uploadLast,&sourceFinal[(size_t)fp.Offset+255*fp.Footprint.RowPitch+255*4],4);
++ c.log("COMMITTED_DEFAULT uploadSourceIntact=%u uploadSourceIntactFinal=%u lastTexel=%08x expected=%08x changedTexels=%u firstChanged=%d uploadLastTexel=%08x",intact1,intact2,lastActual,expected[count-1],changed,first,uploadLast);
++ c.result.committedDefaultChanged+=changed; if(!intact1||!intact2)++c.result.uploadSourceDamaged;
++}
++// [D] Overlapping buffer copies in one command list.
++void copyOrderSuite(Context&c) {
++ const UINT repetitions=20; const U64 n=82432,size=Prefix+n+Tail;
++ std::vector<unsigned char> payload((size_t)n),guard((size_t)size,0x6d);
++ for(U64 i=0;i<n;++i){unsigned char b=(unsigned char)((i*131+17)&0xff);payload[(size_t)i]=b==0x6d?0x6e:b;}
++ auto payloadBuffer=qbuf(c,n,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ), init=qbuf(c,size,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
++ if(!payloadBuffer||!init||!qfill(c,payloadBuffer.Get(),payload)||!qfill(c,init.Get(),guard))return;
++ const char*names[4]={"D1","D2","D3","D4"};
++ const char*descriptions[4]={"init-copy-then-overlapping-payload-copy-same-list-no-barrier","same-copies-in-separate-ExecuteCommandLists-with-fence","same-list-UAV-barrier-with-null-resource-between","payload-copied-to-a-different-non-overlapping-buffer"};
++ for(int v=0;v<4&&!c.fatal;++v) {
++ c.log("COPY_ORDER_VARIANT variant=%s description=%s payloadBytes=%llu prefix=%u tail=%u",names[v],descriptions[v],n,Prefix,Tail);
++ UINT failures=0;
++ for(UINT r=1;r<=repetitions&&!c.fatal;++r) {
++ auto padded=qbuf(c,size,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST); ComPtr<ID3D12Resource> other;
++ if(v==3)other=qbuf(c,n,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
++ if(!padded||(v==3&&!other)||!c.begin())return;
++ c.list->CopyBufferRegion(padded.Get(),0,init.Get(),0,size);
++ if(v==1){ if(!c.submit("copy-order-init")||!c.begin())return; }
++ if(v==2){ D3D12_RESOURCE_BARRIER b={}; b.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV; b.UAV.pResource=nullptr; c.list->ResourceBarrier(1,&b); }
++ if(v==3)c.list->CopyBufferRegion(other.Get(),0,payloadBuffer.Get(),0,n); else c.list->CopyBufferRegion(padded.Get(),Prefix,payloadBuffer.Get(),0,n);
++ if(!c.submit("copy-order-payload"))return;
++ std::vector<unsigned char> a,b; if(!c.read(padded.Get(),size,a)||(v==3&&!c.read(other.Get(),n,b)))return;
++ U64 bad=0,guardBad=0; long long firstBad=-1;
++ for(U64 i=0;i<n;++i){unsigned char got=v==3?b[(size_t)i]:a[(size_t)(Prefix+i)];if(got!=payload[(size_t)i]){if(firstBad<0)firstBad=(long long)i;++bad;}}
++ for(U64 i=0;i<size;++i)if((v==3||i<Prefix||i>=Prefix+n)&&a[(size_t)i]!=0x6d)++guardBad;
++ bool fail=bad||guardBad; if(fail)++failures;
++ c.log("COPY_ORDER variant=%s repetition=%u result=%s badBytes=%llu firstBadOffset=%lld guardBadBytes=%llu",names[v],r,fail?"FAIL":"PASS",bad,firstBad,guardBad);
++ }
++ c.result.copyOrderFailures[v]+=failures; c.log("COPY_ORDER_SUMMARY variant=%s failures=%u/%u",names[v],failures,repetitions);
++ }
++}
 +} // namespace
-+Result Run(const Options&options,LogSink sink,void*user) {
++static Result runLegacy(const Options&options,LogSink sink,void*user) {
 + // Keep pending resources and the fence event alive through process exit on a
 + // timeout/device failure. Destructing an in-flight fixture is unsafe.
 + auto context=new Context(options,sink,user);Context&c=*context;
@@ -22000,30 +22337,699 @@ index 0000000..3be64f0
 + c.log("SUMMARY cases=%u mismatches=%u unavailable=%u selfTestsFailed=%u deviceFailed=%u debugErrors=%u pendingResourcesRetained=%u",c.result.casesCompleted,c.result.mismatchCases,c.result.unavailableCases,c.result.selfTestsFailed,c.result.deviceFailed,c.result.debugErrors,c.fatal);
 + Result result=c.result;if(!c.fatal)delete context;return result;
 +}
++static Result runDefault(const Options&requested,LogSink sink,void*user) {
++ // One pass on one device with DRED forced off; the minimal repro owns its own device and runs first.
++ Options options=requested; options.dredEnabled=false;
++ ReproStatus repro; int reproFailures=RunMinimalRepro(sink,user,options.warp,&repro);
++ auto context=new Context(options,sink,user); Context&c=*context;
++ c.result.reproFailures=(unsigned)reproFailures; c.result.unavailableCases+=repro.unavailableVariants; c.result.deviceFailed=repro.deviceFailed;
++ c.logFences=false;
++ if(c.initialize()) {
++ runMapSuite(c); if(!c.fatal)c.retained.clear();
++ if(!c.fatal)committedCpuCase(c,false); if(!c.fatal)committedCpuCase(c,true); if(!c.fatal)committedDefaultCase(c);
++ if(!c.fatal)c.retained.clear();
++ if(!c.fatal)copyOrderSuite(c);
++ if(options.injection==Injection::MapOutsideWord&&!c.result.injectionsAttempted){++c.result.selfTestsFailed;c.log("SELF_TEST_FAIL requested map injection was not exercised");}
++ c.inspectDebug();
++ }
++ const Result&r=c.result;
++ c.log("MAP_SUMMARY reproFailures=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u deviceFailed=%u mapCasesRun=%u committedDefaultChanged=%u uploadSourceDamaged=%u injectionsAttempted=%u injectionsDetected=%u debugErrors=%u pendingResourcesRetained=%u",
++ r.reproFailures,r.mapCasesWithOutsideWrites,r.unavailableCases,r.committedCpuChanged,r.copyOrderFailures[0],r.copyOrderFailures[1],r.copyOrderFailures[2],r.copyOrderFailures[3],
++ r.selfTestsFailed,r.deviceFailed,r.mapCasesRun,r.committedDefaultChanged,r.uploadSourceDamaged,r.injectionsAttempted,r.injectionsDetected,r.debugErrors,c.fatal);
++ Result result=c.result; if(!c.fatal)delete context; return result;
++}
++Result Run(const Options&options,LogSink sink,void*user) {
++ return options.legacySuite?runLegacy(options,sink,user):runDefault(options,sink,user);
++}
 +} // namespace rrdiag
 diff --git a/src/hardware/r_d3d12/isolation/isolation.h b/src/hardware/r_d3d12/isolation/isolation.h
 new file mode 100644
-index 0000000..ffe1fd6
+index 0000000..971cfe6
 --- /dev/null
 +++ b/src/hardware/r_d3d12/isolation/isolation.h
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,32 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// Independent D3D12 placement diagnostics; no engine or host dependencies.
 +#pragma once
 +namespace rrdiag {
-+enum class Injection { None, SentinelFirstWordZero, OwnerLastWordZero };
++enum class Injection { None, SentinelFirstWordZero, OwnerLastWordZero, MapOutsideWord };
 +struct Options {
 + bool warp=false, debug=false, gpuValidation=false, dredEnabled=false, quick=false;
++ // Run the original 408-case sentinel matrix instead of the default suite.
++ bool legacySuite=false;
 + unsigned repeats=2;
 + Injection injection=Injection::None;
 +};
 +struct Result {
 + unsigned casesCompleted=0, mismatchCases=0, unavailableCases=0, selfTestsFailed=0;
 + bool deviceFailed=false, debugErrors=false;
++ // Default suite: minimal repro, byte-level map, committed CPU-visible test, copy ordering.
++ unsigned reproFailures=0, mapCasesRun=0, mapCasesWithOutsideWrites=0;
++ unsigned committedCpuChanged=0, committedDefaultChanged=0, uploadSourceDamaged=0;
++ unsigned copyOrderFailures[4]={0,0,0,0};
++ unsigned injectionsAttempted=0, injectionsDetected=0;
 +};
 +using LogSink=void(*)(void*,const char*);
++// Runs the default suite (or the legacy matrix when requested).
 +Result Run(const Options&,LogSink,void*);
++struct ReproStatus {
++ unsigned unavailableVariants=0;
++ bool deviceFailed=false;
++};
++// Self-contained minimal reproduction on its own fresh device (see minimal_repro.cpp).
++// Returns the number of failing checks. Needs only d3d12/dxgi.
++int RunMinimalRepro(LogSink,void*,bool warp=false,ReproStatus* status=nullptr);
 +}
+diff --git a/src/hardware/r_d3d12/isolation/minimal_repro.cpp b/src/hardware/r_d3d12/isolation/minimal_repro.cpp
+new file mode 100644
+index 0000000..88ed6c7
+--- /dev/null
++++ b/src/hardware/r_d3d12/isolation/minimal_repro.cpp
+@@ -0,0 +1,624 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++//
++// Minimal Direct3D 12 reproduction of a placed-resource memory-corruption problem
++// seen on Xbox One X (adapter "SraKmd", vendor 0x1414, device 0xd000; UMA with
++// cache-coherent UMA; ResourceHeapTier 2).
++//
++// Summary of the problem
++// ----------------------
++// A 256x256 RGBA8 single-mip texture is placed at offset 0 of a heap. A buffer is
++// placed in the same heap at an offset equal to the SizeInBytes that
++// GetResourceAllocationInfo reports for the texture (262144 bytes; 64 KB aligned),
++// so the two resources are adjacent and do not overlap. The buffer holds a known
++// pattern. The texture is never read from or written to; it is only created and
++// then transitioned between resource states with fenced barriers.
++//
++// On the affected device the first DWORD of the neighbouring buffer changes:
++//   - CreatePlacedResource(texture) alone (no GPU work) can change it.
++//   - A later COMMON -> COPY_DEST (and COPY_DEST -> COPY_SOURCE) transition changes it
++//     again.
++// No overlap, no aliasing and no GPU access to the buffer are involved, so the
++// driver appears to keep a few bytes of per-texture state immediately after the
++// texture's data, outside the size GetResourceAllocationInfo reports. A 64 KB gap
++// between the two resources avoids the problem.
++//
++// What this file does
++// -------------------
++// It creates its own device (nothing else in the process runs first) and performs
++// two variants of the same experiment:
++//
++//   custom   - a CUSTOM heap (WRITE_BACK, memory pool L0, i.e. what
++//              GetCustomHeapProperties(UPLOAD) returns). The buffer is persistently
++//              mapped and the CPU reads it back directly after each step.
++//   default  - a DEFAULT heap. The buffer is filled by a GPU copy from an UPLOAD
++//              buffer, and after each step its first 16 bytes are copied by the GPU
++//              to a READBACK buffer and compared on the CPU.
++//
++// Each check logs one line:
++//   REPRO variant=<custom|default> step=<step> word0=<hex> expected=<hex> result=PASS|FAIL
++// A check fails if word0 or any other word of the neighbouring buffer differs from the
++// pattern (extra detail lines start with REPRO_DETAIL). The function returns the number
++// of failing checks (or API failures) and logs "REPRO_SUMMARY failures=<n>".
++//
++// Only d3d12/dxgi and the C++ runtime are used; the file can be built on its own.
++#include "isolation.h"
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <d3d12.h>
++#include <dxgi1_4.h>
++#include <wrl/client.h>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace rrdiag {
++namespace {
++using Microsoft::WRL::ComPtr;
++using U64 = unsigned long long;
++
++constexpr UINT kNeighbourBytes = 65536;
++constexpr UINT kNeighbourWords = kNeighbourBytes / 4;
++constexpr UINT kReadbackBytes = 16;
++constexpr UINT kReadbackWords = kReadbackBytes / 4;
++constexpr DWORD kWaitMilliseconds = 5000;
++
++// The known pattern written to the neighbouring buffer. Word 0 is never 0 or 1, the
++// values the driver has been seen to store.
++UINT PatternWord(UINT index)
++{
++	return 0xA5A50000u + index;
++}
++
++D3D12_HEAP_PROPERTIES StandardHeap(D3D12_HEAP_TYPE type)
++{
++	D3D12_HEAP_PROPERTIES properties = {};
++	properties.Type = type;
++	properties.CreationNodeMask = 1;
++	properties.VisibleNodeMask = 1;
++	return properties;
++}
++
++D3D12_RESOURCE_DESC BufferDesc(U64 bytes)
++{
++	D3D12_RESOURCE_DESC desc = {};
++	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++	desc.Width = bytes;
++	desc.Height = 1;
++	desc.DepthOrArraySize = 1;
++	desc.MipLevels = 1;
++	desc.SampleDesc.Count = 1;
++	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++	return desc;
++}
++
++// 256x256 RGBA8, one mip, default (UNKNOWN) layout, default alignment, no flags.
++D3D12_RESOURCE_DESC TextureDesc()
++{
++	D3D12_RESOURCE_DESC desc = {};
++	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++	desc.Width = 256;
++	desc.Height = 256;
++	desc.DepthOrArraySize = 1;
++	desc.MipLevels = 1;
++	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++	desc.SampleDesc.Count = 1;
++	return desc;
++}
++
++// What one check observed in the neighbouring buffer.
++struct Observation
++{
++	UINT word0 = 0;
++	UINT changedWords = 0;
++	UINT firstChangedWord = 0;
++};
++
++class Repro
++{
++public:
++	Repro(LogSink sink, void* user, bool warp, ReproStatus* status)
++		: sink_(sink), user_(user), warp_(warp), status_(status) {}
++	~Repro()
++	{
++		if (event_)
++			CloseHandle(event_);
++	}
++
++	int Run();
++	// True when a GPU wait failed; the caller must then leak this object because the
++	// GPU may still be using its resources.
++	bool Fatal() const { return fatal_; }
++
++private:
++	void Log(const char* format, ...);
++	bool Api(HRESULT hr, const char* api);
++	void Unavailable(const char* variant, const char* reason);
++	bool Initialize();
++
++	template <class T>
++	void Keep(const ComPtr<T>& object)
++	{
++		ComPtr<IUnknown> unknown;
++		if (object && SUCCEEDED(object.As(&unknown)))
++			kept_.push_back(unknown);
++	}
++
++	bool BeginList();
++	bool ExecuteAndWait();
++	void Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after);
++	ComPtr<ID3D12Resource> CommittedBuffer(U64 bytes, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state);
++	bool Report(const char* variant, const char* step, const Observation& seen);
++
++	void RunCustomHeapVariant();
++	void RunDefaultHeapVariant();
++	bool ReadNeighbourThroughGpu(ID3D12Resource* neighbour, ID3D12Resource* readback, Observation& seen);
++
++	LogSink sink_;
++	void* user_;
++	bool warp_;
++	ReproStatus* status_;
++	int failures_ = 0;
++	bool fatal_ = false;
++	bool uma_ = false;
++	bool cacheCoherentUma_ = false;
++	bool heapTier2_ = false;
++
++	ComPtr<IDXGIFactory4> factory_;
++	ComPtr<IDXGIAdapter1> adapter_;
++	ComPtr<ID3D12Device> device_;
++	ComPtr<ID3D12CommandQueue> queue_;
++	ComPtr<ID3D12CommandAllocator> allocator_;
++	ComPtr<ID3D12GraphicsCommandList> list_;
++	ComPtr<ID3D12Fence> fence_;
++	HANDLE event_ = nullptr;
++	U64 fenceValue_ = 0;
++	// Everything stays alive until the object is destroyed, which only happens when
++	// all GPU work is known to have finished.
++	std::vector<ComPtr<IUnknown>> kept_;
++};
++
++void Repro::Log(const char* format, ...)
++{
++	char text[1024];
++	va_list args;
++	va_start(args, format);
++	std::vsnprintf(text, sizeof(text), format, args);
++	va_end(args);
++	if (sink_)
++		sink_(user_, text);
++}
++
++// Returns true on success. A failure is logged and counted as a failing check; if the
++// device was removed, every later variant is skipped.
++bool Repro::Api(HRESULT hr, const char* api)
++{
++	if (SUCCEEDED(hr))
++		return true;
++	Log("REPRO_API_FAILURE api=%s hr=0x%08lx", api, static_cast<unsigned long>(hr));
++	++failures_;
++	if (device_ && FAILED(device_->GetDeviceRemovedReason()))
++	{
++		Log("REPRO_DEVICE_REMOVED reason=0x%08lx", static_cast<unsigned long>(device_->GetDeviceRemovedReason()));
++		fatal_ = true;
++		if (status_)
++			status_->deviceFailed = true;
++	}
++	return false;
++}
++
++void Repro::Unavailable(const char* variant, const char* reason)
++{
++	Log("REPRO_UNAVAILABLE variant=%s reason=%s", variant, reason);
++	if (status_)
++		++status_->unavailableVariants;
++}
++
++bool Repro::Initialize()
++{
++	if (!Api(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)), "CreateDXGIFactory2"))
++		return false;
++	if (warp_)
++	{
++		if (!Api(factory_->EnumWarpAdapter(IID_PPV_ARGS(&adapter_)), "EnumWarpAdapter"))
++			return false;
++	}
++	else
++	{
++		for (UINT index = 0;; ++index)
++		{
++			ComPtr<IDXGIAdapter1> candidate;
++			const HRESULT hr = factory_->EnumAdapters1(index, &candidate);
++			if (hr == DXGI_ERROR_NOT_FOUND)
++				break;
++			if (FAILED(hr))
++				continue;
++			DXGI_ADAPTER_DESC1 desc = {};
++			candidate->GetDesc1(&desc);
++			if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
++				continue;
++			if (SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr)))
++			{
++				adapter_ = candidate;
++				break;
++			}
++		}
++		if (!adapter_)
++		{
++			Log("REPRO_UNAVAILABLE variant=all reason=no-hardware-d3d12-adapter");
++			if (status_)
++				status_->unavailableVariants += 2;
++			return false;
++		}
++	}
++
++	DXGI_ADAPTER_DESC1 adapterDesc = {};
++	adapter_->GetDesc1(&adapterDesc);
++	char name[256] = {};
++	WideCharToMultiByte(CP_UTF8, 0, adapterDesc.Description, -1, name, sizeof(name), nullptr, nullptr);
++
++	if (!Api(D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)), "D3D12CreateDevice"))
++		return false;
++
++	D3D12_FEATURE_DATA_ARCHITECTURE architecture = {};
++	const HRESULT architectureHr = device_->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &architecture, sizeof(architecture));
++	D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
++	const HRESULT optionsHr = device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
++	uma_ = SUCCEEDED(architectureHr) && architecture.UMA;
++	cacheCoherentUma_ = SUCCEEDED(architectureHr) && architecture.CacheCoherentUMA;
++	heapTier2_ = SUCCEEDED(optionsHr) && options.ResourceHeapTier == D3D12_RESOURCE_HEAP_TIER_2;
++	Log("REPRO_ADAPTER description=%s vendor=0x%04x device=0x%04x warp=%u UMA=%u cacheCoherentUMA=%u resourceHeapTier=%u",
++		name, adapterDesc.VendorId, adapterDesc.DeviceId, warp_ ? 1u : 0u, uma_ ? 1u : 0u, cacheCoherentUma_ ? 1u : 0u,
++		static_cast<unsigned>(options.ResourceHeapTier));
++
++	D3D12_COMMAND_QUEUE_DESC queueDesc = {};
++	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++	if (!Api(device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue_)), "CreateCommandQueue") ||
++		!Api(device_->CreateCommandAllocator(queueDesc.Type, IID_PPV_ARGS(&allocator_)), "CreateCommandAllocator") ||
++		!Api(device_->CreateCommandList(0, queueDesc.Type, allocator_.Get(), nullptr, IID_PPV_ARGS(&list_)), "CreateCommandList") ||
++		!Api(list_->Close(), "CommandList.Close") ||
++		!Api(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "CreateFence"))
++		return false;
++	event_ = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
++	if (!event_)
++	{
++		Api(HRESULT_FROM_WIN32(GetLastError()), "CreateEventExW");
++		return false;
++	}
++	return true;
++}
++
++bool Repro::BeginList()
++{
++	return Api(allocator_->Reset(), "CommandAllocator.Reset") && Api(list_->Reset(allocator_.Get(), nullptr), "CommandList.Reset");
++}
++
++// Closes and executes the current list and waits for it with a fence. Every GPU step in
++// this file is fenced, so no work from one step overlaps the next.
++bool Repro::ExecuteAndWait()
++{
++	if (!Api(list_->Close(), "CommandList.Close"))
++		return false;
++	ID3D12CommandList* lists[] = {list_.Get()};
++	queue_->ExecuteCommandLists(1, lists);
++	++fenceValue_;
++	if (!Api(queue_->Signal(fence_.Get(), fenceValue_), "Queue.Signal"))
++		return false;
++	if (fence_->GetCompletedValue() < fenceValue_)
++	{
++		if (!Api(fence_->SetEventOnCompletion(fenceValue_, event_), "Fence.SetEventOnCompletion"))
++			return false;
++		if (WaitForSingleObjectEx(event_, kWaitMilliseconds, FALSE) != WAIT_OBJECT_0)
++		{
++			Log("REPRO_FATAL_WAIT fence=%llu timeoutMs=%lu", fenceValue_, static_cast<unsigned long>(kWaitMilliseconds));
++			++failures_;
++			fatal_ = true;
++			if (status_)
++				status_->deviceFailed = true;
++			return false;
++		}
++	}
++	return Api(device_->GetDeviceRemovedReason(), "GetDeviceRemovedReason");
++}
++
++void Repro::Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
++{
++	D3D12_RESOURCE_BARRIER barrier = {};
++	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++	barrier.Transition.pResource = resource;
++	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++	barrier.Transition.StateBefore = before;
++	barrier.Transition.StateAfter = after;
++	list_->ResourceBarrier(1, &barrier);
++}
++
++ComPtr<ID3D12Resource> Repro::CommittedBuffer(U64 bytes, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state)
++{
++	ComPtr<ID3D12Resource> buffer;
++	const D3D12_HEAP_PROPERTIES heap = StandardHeap(type);
++	const D3D12_RESOURCE_DESC desc = BufferDesc(bytes);
++	if (Api(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&buffer)),
++			"CreateCommittedResource(buffer)"))
++		Keep(buffer);
++	return buffer;
++}
++
++bool Repro::Report(const char* variant, const char* step, const Observation& seen)
++{
++	const bool pass = seen.changedWords == 0;
++	Log("REPRO variant=%s step=%s word0=%08x expected=%08x result=%s", variant, step, seen.word0, PatternWord(0), pass ? "PASS" : "FAIL");
++	if (!pass)
++	{
++		Log("REPRO_DETAIL variant=%s step=%s changedWords=%u firstChangedWord=%u", variant, step, seen.changedWords, seen.firstChangedWord);
++		++failures_;
++	}
++	return pass;
++}
++
++// Variant 1: CUSTOM heap, buffer mapped and checked directly by the CPU.
++void Repro::RunCustomHeapVariant()
++{
++	const char* variant = "custom";
++	if (!(uma_ && cacheCoherentUma_ && heapTier2_) && !(warp_ && heapTier2_))
++	{
++		Unavailable(variant, "requires-UMA-cache-coherent-UMA-and-resource-heap-tier-2");
++		return;
++	}
++	const D3D12_HEAP_PROPERTIES custom = device_->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_UPLOAD);
++	Log("REPRO_HEAP variant=%s query=GetCustomHeapProperties(UPLOAD) type=%u cpuPageProperty=%u memoryPool=%u",
++		variant, static_cast<unsigned>(custom.Type), static_cast<unsigned>(custom.CPUPageProperty),
++		static_cast<unsigned>(custom.MemoryPoolPreference));
++	// Hardware must offer exactly WRITE_BACK/L0; WARP (used only to check this code) may differ.
++	const bool writeBackL0 = custom.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK &&
++		custom.MemoryPoolPreference == D3D12_MEMORY_POOL_L0;
++	if (custom.Type != D3D12_HEAP_TYPE_CUSTOM || (!writeBackL0 && !warp_))
++	{
++		Unavailable(variant, "no-write-back-L0-custom-heap");
++		return;
++	}
++
++	const D3D12_RESOURCE_DESC textureDesc = TextureDesc();
++	const D3D12_RESOURCE_DESC bufferDesc = BufferDesc(kNeighbourBytes);
++	const D3D12_RESOURCE_ALLOCATION_INFO textureInfo = device_->GetResourceAllocationInfo(0, 1, &textureDesc);
++	Log("REPRO_ALLOC variant=%s textureSizeInBytes=%llu textureAlignment=%llu", variant, textureInfo.SizeInBytes, textureInfo.Alignment);
++	if (textureInfo.SizeInBytes == UINT64_MAX || textureInfo.SizeInBytes % 65536 != 0)
++	{
++		Unavailable(variant, "texture-size-not-64KB-aligned");
++		return;
++	}
++	// The neighbour starts exactly where the texture's reported size ends.
++	const U64 neighbourOffset = textureInfo.SizeInBytes;
++
++	D3D12_HEAP_DESC heapDesc = {};
++	heapDesc.SizeInBytes = neighbourOffset + kNeighbourBytes;
++	heapDesc.Properties = custom;
++	heapDesc.Alignment = 65536;
++	heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
++	ComPtr<ID3D12Heap> heap;
++	ComPtr<ID3D12Resource> neighbour;
++	if (!Api(device_->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "CreateHeap(custom)"))
++		return;
++	Keep(heap);
++	if (!Api(device_->CreatePlacedResource(heap.Get(), neighbourOffset, &bufferDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
++				 IID_PPV_ARGS(&neighbour)),
++			"CreatePlacedResource(buffer)"))
++		return;
++	Keep(neighbour);
++	Log("REPRO_LAYOUT variant=%s heapSize=%llu textureOffset=0 textureEnd=%llu bufferOffset=%llu bufferEnd=%llu",
++		variant, heapDesc.SizeInBytes, textureInfo.SizeInBytes, neighbourOffset, neighbourOffset + kNeighbourBytes);
++
++	void* mapped = nullptr;
++	if (!Api(neighbour->Map(0, nullptr, &mapped), "Resource.Map(buffer)") || !mapped)
++		return;
++	volatile UINT* words = static_cast<volatile UINT*>(mapped);
++	for (UINT i = 0; i < kNeighbourWords; ++i)
++		words[i] = PatternWord(i);
++	MemoryBarrier();
++
++	auto observe = [&]() {
++		MemoryBarrier();
++		Observation seen;
++		seen.word0 = words[0];
++		for (UINT i = 0; i < kNeighbourWords; ++i)
++		{
++			if (words[i] != PatternWord(i))
++			{
++				if (!seen.changedWords)
++					seen.firstChangedWord = i;
++				++seen.changedWords;
++			}
++		}
++		return seen;
++	};
++
++	Report(variant, "buffer_filled", observe());
++
++	// CreatePlacedResource is followed by the read with nothing in between: the log call
++	// comes after the observation, so no other API call can be blamed for a change.
++	ComPtr<ID3D12Resource> texture;
++	const HRESULT createHr = device_->CreatePlacedResource(heap.Get(), 0, &textureDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
++		IID_PPV_ARGS(&texture));
++	const Observation afterCreate = observe();
++	if (!Api(createHr, "CreatePlacedResource(texture)"))
++	{
++		neighbour->Unmap(0, nullptr);
++		return;
++	}
++	Keep(texture);
++	Report(variant, "create_texture", afterCreate);
++
++	struct Step
++	{
++		const char* name;
++		D3D12_RESOURCE_STATES before;
++		D3D12_RESOURCE_STATES after;
++	};
++	const Step steps[] = {
++		{"transition_COMMON_to_COPY_DEST", D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST},
++		{"transition_COPY_DEST_to_COPY_SOURCE", D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE},
++	};
++	for (const Step& step : steps)
++	{
++		if (fatal_ || !BeginList())
++			break;
++		Transition(texture.Get(), step.before, step.after);
++		if (!ExecuteAndWait())
++			break;
++		Report(variant, step.name, observe());
++	}
++	if (!fatal_)
++		neighbour->Unmap(0, nullptr);
++}
++
++// Copies the neighbour's first 16 bytes to the READBACK buffer and reads them on the CPU.
++bool Repro::ReadNeighbourThroughGpu(ID3D12Resource* neighbour, ID3D12Resource* readback, Observation& seen)
++{
++	if (!BeginList())
++		return false;
++	list_->CopyBufferRegion(readback, 0, neighbour, 0, kReadbackBytes);
++	if (!ExecuteAndWait())
++		return false;
++	void* mapped = nullptr;
++	const D3D12_RANGE readRange = {0, kReadbackBytes};
++	if (!Api(readback->Map(0, &readRange, &mapped), "Resource.Map(readback)") || !mapped)
++		return false;
++	UINT values[kReadbackWords];
++	std::memcpy(values, mapped, sizeof(values));
++	const D3D12_RANGE wroteNothing = {0, 0};
++	readback->Unmap(0, &wroteNothing);
++	seen = Observation();
++	seen.word0 = values[0];
++	for (UINT i = 0; i < kReadbackWords; ++i)
++	{
++		if (values[i] != PatternWord(i))
++		{
++			if (!seen.changedWords)
++				seen.firstChangedWord = i;
++			++seen.changedWords;
++		}
++	}
++	return true;
++}
++
++// Variant 2: DEFAULT heap, buffer filled and checked with GPU copies.
++void Repro::RunDefaultHeapVariant()
++{
++	const char* variant = "default";
++	if (!heapTier2_)
++	{
++		Unavailable(variant, "requires-resource-heap-tier-2");
++		return;
++	}
++	const D3D12_RESOURCE_DESC textureDesc = TextureDesc();
++	const D3D12_RESOURCE_DESC bufferDesc = BufferDesc(kNeighbourBytes);
++	const D3D12_RESOURCE_ALLOCATION_INFO textureInfo = device_->GetResourceAllocationInfo(0, 1, &textureDesc);
++	Log("REPRO_ALLOC variant=%s textureSizeInBytes=%llu textureAlignment=%llu", variant, textureInfo.SizeInBytes, textureInfo.Alignment);
++	if (textureInfo.SizeInBytes == UINT64_MAX || textureInfo.SizeInBytes % 65536 != 0)
++	{
++		Unavailable(variant, "texture-size-not-64KB-aligned");
++		return;
++	}
++	const U64 neighbourOffset = textureInfo.SizeInBytes;
++
++	D3D12_HEAP_DESC heapDesc = {};
++	heapDesc.SizeInBytes = neighbourOffset + kNeighbourBytes;
++	heapDesc.Properties = StandardHeap(D3D12_HEAP_TYPE_DEFAULT);
++	heapDesc.Alignment = 65536;
++	heapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
++	ComPtr<ID3D12Heap> heap;
++	ComPtr<ID3D12Resource> neighbour;
++	if (!Api(device_->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap)), "CreateHeap(default)"))
++		return;
++	Keep(heap);
++	if (!Api(device_->CreatePlacedResource(heap.Get(), neighbourOffset, &bufferDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++				 IID_PPV_ARGS(&neighbour)),
++			"CreatePlacedResource(buffer)"))
++		return;
++	Keep(neighbour);
++	Log("REPRO_LAYOUT variant=%s heapSize=%llu textureOffset=0 textureEnd=%llu bufferOffset=%llu bufferEnd=%llu",
++		variant, heapDesc.SizeInBytes, textureInfo.SizeInBytes, neighbourOffset, neighbourOffset + kNeighbourBytes);
++
++	ComPtr<ID3D12Resource> upload = CommittedBuffer(kNeighbourBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
++	ComPtr<ID3D12Resource> readback = CommittedBuffer(kReadbackBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
++	if (!upload || !readback)
++		return;
++	void* mapped = nullptr;
++	const D3D12_RANGE noRead = {0, 0};
++	if (!Api(upload->Map(0, &noRead, &mapped), "Resource.Map(upload)") || !mapped)
++		return;
++	UINT* words = static_cast<UINT*>(mapped);
++	for (UINT i = 0; i < kNeighbourWords; ++i)
++		words[i] = PatternWord(i);
++	upload->Unmap(0, nullptr);
++
++	// Fill the neighbour from the upload buffer. It then stays in COPY_SOURCE, so every
++	// later check only needs a copy from it and no barrier on the neighbour.
++	if (!BeginList())
++		return;
++	list_->CopyBufferRegion(neighbour.Get(), 0, upload.Get(), 0, kNeighbourBytes);
++	Transition(neighbour.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
++	if (!ExecuteAndWait())
++		return;
++
++	Observation seen;
++	if (!ReadNeighbourThroughGpu(neighbour.Get(), readback.Get(), seen))
++		return;
++	Report(variant, "buffer_filled", seen);
++
++	ComPtr<ID3D12Resource> texture;
++	if (!Api(device_->CreatePlacedResource(heap.Get(), 0, &textureDesc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&texture)),
++			"CreatePlacedResource(texture)"))
++		return;
++	Keep(texture);
++	if (!ReadNeighbourThroughGpu(neighbour.Get(), readback.Get(), seen))
++		return;
++	Report(variant, "create_texture", seen);
++
++	struct Step
++	{
++		const char* name;
++		D3D12_RESOURCE_STATES before;
++		D3D12_RESOURCE_STATES after;
++	};
++	const Step steps[] = {
++		{"transition_COMMON_to_COPY_DEST", D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST},
++		{"transition_COPY_DEST_to_COPY_SOURCE", D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE},
++	};
++	for (const Step& step : steps)
++	{
++		if (fatal_ || !BeginList())
++			return;
++		Transition(texture.Get(), step.before, step.after);
++		if (!ExecuteAndWait() || !ReadNeighbourThroughGpu(neighbour.Get(), readback.Get(), seen))
++			return;
++		Report(variant, step.name, seen);
++	}
++}
++
++int Repro::Run()
++{
++	Log("REPRO_BEGIN texture=256x256_RGBA8_1mip neighbour=64KB_buffer_at_texture_SizeInBytes warp=%u", warp_ ? 1u : 0u);
++	if (Initialize())
++	{
++		RunCustomHeapVariant();
++		if (!fatal_)
++			RunDefaultHeapVariant();
++	}
++	Log("REPRO_SUMMARY failures=%d", failures_);
++	return failures_;
++}
++} // namespace
++
++int RunMinimalRepro(LogSink sink, void* user, bool warp, ReproStatus* status)
++{
++	// If a GPU wait times out the object is deliberately leaked: destroying resources
++	// the GPU may still be using is unsafe.
++	Repro* repro = new Repro(sink, user, warp, status);
++	const int failures = repro->Run();
++	if (!repro->Fatal())
++		delete repro;
++	return failures;
++}
++} // namespace rrdiag
 diff --git a/src/hardware/r_d3d12/isolation/observe.hlsl b/src/hardware/r_d3d12/isolation/observe.hlsl
 new file mode 100644
 index 0000000..fe6b469

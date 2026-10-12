@@ -26,7 +26,7 @@ if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64') { throw "Use an x64 Visual Studio 2022 de
 foreach ($Tool in 'cl.exe', 'fxc.exe', 'msbuild.exe', 'MakeAppx.exe', 'MakePri.exe', 'SignTool.exe') {
     if (-not (Get-Command $Tool -ErrorAction SilentlyContinue)) { throw "Required Windows build tool missing: $Tool" }
 }
-foreach ($File in 'isolation.h', 'isolation.cpp', 'observe.hlsl') {
+foreach ($File in 'isolation.h', 'isolation.cpp', 'minimal_repro.cpp', 'observe.hlsl') {
     if (-not (Test-Path (Join-Path $Core $File))) { throw "Patched isolation source missing: $Core/$File" }
 }
 foreach ($Directory in $Output, $Shaders, $Logs, $Install, $Stage) {
@@ -113,12 +113,13 @@ Push-Location $Output
 try {
     Exec {
         cl.exe /nologo /std:c++17 /O2 /EHsc /W4 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX `
-            "/I$Core" "/I$Generated" (Join-Path $PSScriptRoot 'console.cpp') (Join-Path $Core 'isolation.cpp') `
+            "/I$Core" "/I$Generated" (Join-Path $PSScriptRoot 'console.cpp') (Join-Path $Core 'isolation.cpp') (Join-Path $Core 'minimal_repro.cpp') `
             "/Fe:$Console" /link d3d12.lib dxgi.lib dxguid.lib
     }
 } finally { Pop-Location }
 
-function RunProbe([string]$Name, [string[]]$Arguments, [int]$ExpectedExit) {
+# Runs the legacy 408-case matrix (only used for its injection self-tests).
+function RunLegacyProbe([string]$Name, [string[]]$Arguments, [int]$ExpectedExit) {
     $Log = Join-Path $Logs "$Name.txt"
     Write-Host "Running $Name; complete observations: $Log"
     & $Console @Arguments *> $Log
@@ -141,112 +142,114 @@ function RunProbe([string]$Name, [string[]]$Arguments, [int]$ExpectedExit) {
     return ,$Lines
 }
 
-function VerifyHealthy([string]$Name, [string[]]$Lines) {
-    $Summary = @($Lines | Where-Object { $_ -match '^HOST_RESULT ' })[0]
-    if ($Summary -notmatch 'mismatches=0 ') { throw "$Name detected a memory mismatch." }
-    $Coverage = @{}
-    $Current = $null
-    $Phases = @{}
-    $Endpoints = @{}
-    $Controls = @{}
-    $SelfTest = $false
-    $Ends = 0
-    $Starts = 0
-    foreach ($Line in $Lines) {
-        if ($Line -match '^CASE ') {
-            ++$Starts
-            $Current = $null
-            $Phases = @{}
-            $Endpoints = @{}
-            $Controls = @{}
-            $SelfTest = $false
-            if ($Line -match '\bcoverage=primary observer=(shader|copy|toggle) layout=(adjacent|gap4096|committed) width=(64|256) format=RGBA8 state=(COMMON|COPY_DEST|COPY_SOURCE|PIXEL_SHADER_RESOURCE) order=sentinel-first repetition=([12])\b') {
-                $Current = "$($Matches[2])/$($Matches[3])/$($Matches[1])/$($Matches[4])/$($Matches[5])"
-            }
-        }
-        if ($Line -match '^SELF_TEST name=(shader-pack-and-baseline|copy-baseline) result=pass knownPatterns=asymmetric,all-zero,all-255$') {
-            $SelfTest = $true
-        }
-        if ($Line -match '^OBSERVE_ENDPOINTS target=(sentinel|owner) phase=([^ ]+) firstExpected=([0-9a-f]{8}) firstA=([0-9a-f]{8}) firstB=([0-9a-f]{8}) lastIndex=([0-9]+) lastExpected=([0-9a-f]{8}) lastA=([0-9a-f]{8}) lastB=([0-9a-f]{8})$') {
-            if ($Matches[3] -cne $Matches[4] -or $Matches[3] -cne $Matches[5] -or $Matches[7] -cne $Matches[8] -or $Matches[7] -cne $Matches[9]) {
-                throw "$Name first/last logical texel differs: $Line"
-            }
-            $Endpoints["$($Matches[1])/$($Matches[2])"] = $true
-        }
-        if ($Line -match '\bRAW_CONTROL target=(sentinel|owner) exact=pass padded=pass remap=pass uploadCPU=pass guard=pass\b') {
-            $Controls[$Matches[1]] = $true
-        }
-        if ($Line -match '\bCASE_END\b') {
-            ++$Ends
-            if ($Line -match 'mismatch=0 unavailable=0' -and $Current) {
-                foreach ($Required in @(
-                    'sentinel/baseline-repeat', 'sentinel/owner-CPU-create-before-activation',
-                    'sentinel/owner-alias-activation', 'sentinel/owner-transition-COPY_DEST-no-upload',
-                    'sentinel/owner-upload', 'sentinel/owner-transition-COPY_SOURCE-no-copy',
-                    'owner/owner-readback-exact-and-padded', 'sentinel/owner-readback',
-                    'sentinel/owner-transition-PIXEL_SHADER_RESOURCE', 'sentinel/owner-transition-NON_PIXEL_SHADER_RESOURCE',
-                    'owner/owner-shader-load', 'sentinel/owner-shader-load', 'sentinel/owner-release-after-fence',
-                    'sentinel/owner-recreate-before-activation', 'sentinel/owner-recreate-alias-activation')) {
-                    if (-not $Phases.ContainsKey($Required) -or -not $Endpoints.ContainsKey($Required)) {
-                        throw "$Name primary case $Current missing full observation/endpoints $Required"
-                    }
-                }
-                if (-not ($Phases.ContainsKey('sentinel/baseline-no-owner') -or $Phases.ContainsKey('sentinel/baseline-owner-already-exists')) -or
-                    -not $Controls.ContainsKey('sentinel') -or -not $Controls.ContainsKey('owner') -or -not $SelfTest) {
-                    throw "$Name primary case $Current lacks its baseline or both raw controls."
-                }
-                $Coverage[$Current] = $true
-            }
-            $Current = $null
-        }
-        if ($Line -match '\bOBSERVE target=') {
-            if ($Line -notmatch '\bchanged=0\b' -or $Line -notmatch '\boutputsEqual=1\b' -or $Line -notmatch '\bremapEqual=1\b' -or
-                $Line -notmatch '\bprefixTailChanges=0,0\b') {
-                throw "$Name observer/control disagreement: $Line"
-            }
-            if ($Line -match '\bOBSERVE target=(sentinel|owner) phase=([^ ]+)') { $Phases["$($Matches[1])/$($Matches[2])"] = $true }
-            if ($Line -match '\bmethod=shader\b' -and $Line -notmatch 'sourceBefore=NON_PIXEL_SHADER_RESOURCE sourceAfter=NON_PIXEL_SHADER_RESOURCE') {
-                throw "$Name shader observation changed its source state: $Line"
-            }
-        }
-    }
-    # One complete healthy baseline for every requested layout and observer is mandatory.
-    foreach ($Tuple in 'adjacent/64', 'adjacent/256', 'gap4096/64', 'gap4096/256', 'committed/256') {
-        foreach ($Observer in 'shader', 'copy', 'toggle') {
-            foreach ($State in 'COMMON', 'COPY_DEST', 'COPY_SOURCE', 'PIXEL_SHADER_RESOURCE') {
-                foreach ($Repeat in 1, 2) {
-                    if (-not $Coverage.ContainsKey("$Tuple/$Observer/$State/$Repeat")) {
-                        throw "$Name missing healthy primary baseline $Tuple/$Observer/$State/$Repeat"
-                    }
-                }
-            }
-        }
-    }
-    foreach ($Target in 'sentinel', 'owner') {
-        if (-not ($Lines | Where-Object { $_ -match "RAW_CONTROL target=$Target exact=pass padded=pass remap=pass" })) {
-            throw "$Name missing independently mapped exact/padded $Target raw control."
-        }
-    }
-    $ExpectedCases = [int]([regex]::Match($Summary, '\bcases=([0-9]+)\b').Groups[1].Value)
-    $Matrices = @($Lines | Where-Object { $_ -match '^MATRIX ' })
-    if ($Matrices.Count -ne 1 -or $Matrices[0] -notmatch 'repeats=2 primaryLayouts=5 primaryObservers=3 primaryInitialStates=4') {
-        throw "$Name did not run the complete repeated matrix."
-    }
-    $ProjectedCases = [int]([regex]::Match($Matrices[0], '\bprojectedCases=([0-9]+)\b').Groups[1].Value)
-    if ($Starts -ne $Ends -or $Ends -ne $ExpectedCases -or $Ends -ne $ProjectedCases -or $Ends -lt 204) {
-        throw "$Name case begin/end/result counts disagree."
-    }
-    Write-Host "Verified ${Name}: all 15 primary layout/observer baselines across four states and two repeats, independent raw controls and matching observations. Optional unavailable cases remain visible in the log."
+function Get-Fields([string]$Line) {
+    $Fields = @{}
+    foreach ($Match in [regex]::Matches($Line, '([A-Za-z0-9_]+)=(\S+)')) { $Fields[$Match.Groups[1].Value] = $Match.Groups[2].Value }
+    return $Fields
 }
 
-foreach ($Dred in 'off', 'on') {
-    $Name = "warp-dred-$Dred"
-    $Lines = RunProbe $Name @('--warp', '--debug', '--gpu-validation', "--dred-$Dred") 0
-    VerifyHealthy $Name $Lines
+# Runs the default suite and checks that the log is complete and self-consistent.
+function RunDefaultProbe([string]$Name, [string[]]$Arguments, [int]$ExpectedExit) {
+    $Log = Join-Path $Logs "$Name.txt"
+    Write-Host "Running $Name; complete observations: $Log"
+    & $Console @Arguments *> $Log
+    $ExitCode = $LASTEXITCODE
+    if ($ExitCode -ne $ExpectedExit) { throw "$Name failed or crashed: expected exit $ExpectedExit, got $ExitCode; see $Log" }
+    $Lines = @(Get-Content $Log)
+    $Results = @($Lines | Where-Object { $_ -match '^HOST_RESULT ' })
+    $Summaries = @($Lines | Where-Object { $_ -match '^MAP_SUMMARY ' })
+    $ReproSummaries = @($Lines | Where-Object { $_ -match '^REPRO_SUMMARY ' })
+    if ($Results.Count -ne 1 -or $Summaries.Count -ne 1 -or $ReproSummaries.Count -ne 1) { throw "$Name did not complete exactly one default suite." }
+    Write-Host $Summaries[0]
+    $Counts = Get-Fields $Summaries[0]
+    $HostFields = Get-Fields $Results[0]
+    foreach ($Key in 'reproFailures', 'mapCasesWithOutsideWrites', 'unavailable', 'committedCpuChanged', 'copyOrderFailures', 'selfTestsFailed',
+                     'deviceFailed', 'mapCasesRun', 'committedDefaultChanged', 'uploadSourceDamaged', 'injectionsAttempted', 'injectionsDetected', 'debugErrors') {
+        if (-not $Counts.ContainsKey($Key) -or $Counts[$Key] -cne $HostFields[$Key]) { throw "$Name core/host summaries disagree on $Key." }
+    }
+    if ($Counts['reproFailures'] -cne (Get-Fields $ReproSummaries[0])['failures']) { throw "$Name repro summary disagrees with MAP_SUMMARY." }
+    if ($Counts['selfTestsFailed'] -cne '0' -or $Counts['deviceFailed'] -cne '0' -or $Counts['debugErrors'] -cne '0') { throw "$Name reported a validation/device/oracle error." }
+    if (@($Lines | Where-Object { $_ -match '^(API_FAILURE|REPRO_API_FAILURE|REPRO_FATAL_WAIT|FATAL_WAIT|DEVICE_REMOVED|REPRO_DEVICE_REMOVED|SELF_TEST_FAIL) ' }).Count) {
+        throw "$Name logged an API, device or self-test failure."
+    }
+    if (-not ($Lines | Where-Object { $_ -match 'SETTINGS debugRequested=1 debugApplied=1 gbvRequested=1 gbvApplied=1 dredRequested=0 dredApplied=1 configuredBeforeDevice=1' })) {
+        throw "$Name did not actually enable the SDK debug layer and GPU validation with DRED forced off."
+    }
+    return ,$Lines
 }
+
+# WARP is the reference implementation: nothing may change outside any texture, every
+# copy must be ordered, and the same code paths must have actually run.
+function VerifyDefaultHealthy([string]$Name, [string[]]$Lines) {
+    $Counts = Get-Fields (@($Lines | Where-Object { $_ -match '^MAP_SUMMARY ' })[0])
+    foreach ($Zero in 'reproFailures', 'mapCasesWithOutsideWrites', 'committedCpuChanged', 'committedDefaultChanged', 'uploadSourceDamaged', 'injectionsAttempted', 'injectionsDetected') {
+        if ($Counts[$Zero] -cne '0') { throw "$Name expected $Zero=0 on WARP, got $($Counts[$Zero])." }
+    }
+    if ($Counts['copyOrderFailures'] -cne '0/0/0/0') { throw "$Name copy-order failures on WARP: $($Counts['copyOrderFailures'])." }
+    foreach ($Variant in 'custom', 'default') {
+        $Passes = @($Lines | Where-Object { $_ -match "^REPRO variant=$Variant step=\S+ word0=[0-9a-f]{8} expected=[0-9a-f]{8} result=PASS$" })
+        if ($Passes.Count -lt 4) { throw "$Name minimal repro variant $Variant ran $($Passes.Count) passing checks, expected at least 4." }
+        if ($Lines | Where-Object { $_ -match "^REPRO variant=$Variant .* result=FAIL$" }) { throw "$Name minimal repro variant $Variant failed." }
+    }
+    $Begin = @($Lines | Where-Object { $_ -match '^MAP_BEGIN cases=([0-9]+) ' })
+    if ($Begin.Count -ne 1) { throw "$Name has no unique MAP_BEGIN." }
+    $Cases = [int]([regex]::Match($Begin[0], 'cases=([0-9]+)').Groups[1].Value)
+    $Ends = @($Lines | Where-Object { $_ -match '^MAP_CASE_END ' })
+    $Released = @($Lines | Where-Object { $_ -match '^MAP_STEP id=[0-9]+ step=release ' })
+    if ($Ends.Count -ne $Cases -or [int]$Counts['mapCasesRun'] -lt 3 -or $Released.Count -ne [int]$Counts['mapCasesRun']) {
+        throw "$Name map case begin/end/release counts disagree (cases=$Cases ends=$($Ends.Count) run=$($Counts['mapCasesRun']) released=$($Released.Count))."
+    }
+    foreach ($Canonical in 1, 2, 3) {
+        if (-not ($Lines | Where-Object { $_ -match "^MAP_CASE_END id=$Canonical complete=1 " })) { throw "$Name canonical map case $Canonical did not complete." }
+    }
+    foreach ($Line in $Lines) {
+        if ($Line -match '^MAP_STEP ' -and $Line -notmatch ' before=0 inside=[0-9]+ after=0 ') { throw "$Name map step changed memory outside the texture: $Line" }
+        if ($Line -match '^COMMITTED_CPU placement=\S+ step=\S+ changedTexels=[1-9]') { throw "$Name committed CPU texture changed: $Line" }
+    }
+    $Default = @($Lines | Where-Object { $_ -match '^COMMITTED_DEFAULT ' })
+    if ($Default.Count -ne 1 -or $Default[0] -notmatch 'uploadSourceIntact=1 uploadSourceIntactFinal=1 .*changedTexels=0 ') { throw "$Name default-heap committed control failed or did not run." }
+    foreach ($Placement in 'committed', 'placed') {
+        if (-not ($Lines | Where-Object { $_ -match "^COMMITTED_CPU placement=$Placement step=to_COMMON changedTexels=0 " })) {
+            throw "$Name committed CPU test ($Placement) did not run to completion."
+        }
+    }
+    foreach ($Variant in 'D1', 'D2', 'D3', 'D4') {
+        if (-not ($Lines | Where-Object { $_ -ceq "COPY_ORDER_SUMMARY variant=$Variant failures=0/20" })) { throw "$Name copy-order variant $Variant did not pass 20/20." }
+    }
+    Write-Host "Verified ${Name}: minimal repro, $($Counts['mapCasesRun']) map cases with no writes outside the textures, committed CPU/default controls and four copy-order variants."
+}
+
+$Lines = RunDefaultProbe 'warp-default' @('--warp', '--debug', '--gpu-validation') 0
+VerifyDefaultHealthy 'warp-default' $Lines
+
+# Injection self-test: the harness itself clears one DWORD just past each texture; the map
+# suite must report exactly that DWORD, once, at the right offset, and nothing else.
+$Lines = RunDefaultProbe 'negative-map-outside' @('--warp', '--debug', '--gpu-validation', '--quick', '--negative-map-outside') 2
+if (-not ($Lines | Where-Object { $_ -ceq 'NEGATIVE_ORACLE_REJECTED:isolation-map-outside' })) { throw 'negative-map-outside did not reject the injected write.' }
+$Injections = @{}
+$OutsideWords = @{}
+foreach ($Line in $Lines) {
+    if ($Line -match '^MAP_INJECTION id=([0-9]+) rel=([0-9]+) ') { $Injections[$Matches[1]] = [long]$Matches[2] }
+    elseif ($Line -match '^MAP_WORD id=([0-9]+) step=(\S+) rel=(-?[0-9]+) relEnd=(-?[0-9]+) old=[0-9a-f]{8} new=([0-9a-f]{8})$') {
+        $WordId = $Matches[1]; $WordStep = $Matches[2]; $WordRel = [long]$Matches[3]; $WordEnd = [long]$Matches[4]; $WordNew = $Matches[5]
+        if ($WordRel -lt 0 -or $WordEnd -ge 0) {
+            if (-not $OutsideWords.ContainsKey($WordId)) { $OutsideWords[$WordId] = @() }
+            $OutsideWords[$WordId] += ,@($WordStep, $WordRel, $WordNew)
+        }
+    }
+}
+if ($Injections.Count -lt 2) { throw "negative-map-outside injected only $($Injections.Count) case(s)." }
+foreach ($Id in $Injections.Keys) {
+    $Found = @($OutsideWords[$Id])
+    if ($Found.Count -ne 1 -or $Found[0][0] -cne 'activate' -or $Found[0][1] -ne $Injections[$Id] -or $Found[0][2] -cne '00000000') {
+        throw "negative-map-outside case $Id did not report exactly the injected word at rel=$($Injections[$Id])."
+    }
+}
+if ($OutsideWords.Count -ne $Injections.Count) { throw 'negative-map-outside reported outside writes in a case that was not injected.' }
+
 foreach ($Target in 'sentinel', 'owner') {
     $Name = "negative-$Target"
-    $Lines = RunProbe $Name @('--warp', '--debug', '--gpu-validation', '--dred-on', '--quick', '--repeats', '1', "--negative-$Target") 2
+    $Lines = RunLegacyProbe $Name @('--warp', '--debug', '--gpu-validation', '--dred-on', '--legacy-suite', '--quick', '--repeats', '1', "--negative-$Target") 2
     if (-not ($Lines | Where-Object { $_ -ceq "NEGATIVE_ORACLE_REJECTED:isolation-$Target" })) {
         throw "$Name did not reject real GPU corruption of the requested target."
     }

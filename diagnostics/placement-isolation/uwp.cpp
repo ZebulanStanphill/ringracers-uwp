@@ -112,10 +112,10 @@ private:
 			Utf8(AnalyticsInfo::VersionInfo->DeviceFamily).c_str(), Utf8(AnalyticsInfo::VersionInfo->DeviceFamilyVersion).c_str(),
 			(osVersion >> 48) & 0xffff, (osVersion >> 32) & 0xffff, (osVersion >> 16) & 0xffff, osVersion & 0xffff);
 		Log(nullptr, metadata);
-		Log(nullptr, "HOST log=LocalState/placement-isolation-log.txt automatic=1 dredModes=off,on repeats=2");
+		Log(nullptr, "HOST log=LocalState/placement-isolation-log.txt automatic=1 suite=minimal-repro,map,committed-cpu,copy-order dred=off passes=1");
 
 		auto dialog = ref new MessageDialog(
-			"The D3D12 memory isolation tests are running automatically. Leave this app open until the completion message appears. "
+			"The D3D12 memory isolation tests (minimal repro, memory map, committed texture and copy-order tests) are running automatically in one pass. Leave this app open until the completion message appears. "
 			"Results are written to placement-isolation-log.txt in this app's LocalState folder.",
 			"D3D12 isolation test running");
 		auto dispatcher = window_->Dispatcher;
@@ -130,7 +130,8 @@ private:
 			WorkerApartment apartment;
 			const auto start = std::chrono::steady_clock::now();
 			const auto cpuStart = CpuSeconds();
-			unsigned cases = 0, mismatches = 0, unavailable = 0, selfTestsFailed = 0;
+			rrdiag::Result result;
+			bool ran = false;
 			bool failed = FAILED(apartment.result);
 			if (failed)
 			{
@@ -140,22 +141,18 @@ private:
 			}
 			try
 			{
-				for (unsigned mode = 0; mode != 2 && !state.closing && SUCCEEDED(apartment.result); ++mode)
+				if (!state.closing && SUCCEEDED(apartment.result))
 				{
-					state.mode = mode ? "dred-on" : "dred-off";
+					// One pass: the minimal repro on its own device first, then the map,
+					// committed-texture and copy-order tests on a second device. DRED is off.
+					state.mode = "default";
 					rrdiag::Options options;
-					options.dredEnabled = mode != 0;
-					const rrdiag::Result result = rrdiag::Run(options, Log, nullptr);
-					cases += result.casesCompleted;
-					mismatches += result.mismatchCases;
-					unavailable += result.unavailableCases;
-					selfTestsFailed += result.selfTestsFailed;
-					failed |= result.deviceFailed || result.debugErrors || !result.casesCompleted;
+					options.dredEnabled = false;
+					result = rrdiag::Run(options, Log, nullptr);
+					ran = true;
+					failed |= result.deviceFailed || result.debugErrors;
 					if (result.deviceFailed)
-					{
-						Log(nullptr, "HOST_MODE_STOP priorDeviceFailure=1 remainingModesSkipped=1 restartRequired=1");
-						break; // A timed-out device intentionally retains resources until process exit.
-					}
+						Log(nullptr, "HOST_STOP deviceFailure=1 restartRequired=1");
 				}
 			}
 			catch (const std::exception& error)
@@ -172,16 +169,25 @@ private:
 			const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 			const double cpuEnd = CpuSeconds();
 			const double cpu = cpuStart < 0 || cpuEnd < 0 ? -1 : cpuEnd - cpuStart;
-			char summary[512];
-			std::snprintf(summary, sizeof(summary), "HOST_FINISHED cases=%u mismatches=%u unavailable=%u selfTestsFailed=%u failed=%u closed=%u wallSeconds=%.3f cpuSeconds=%.3f",
-				cases, mismatches, unavailable, selfTestsFailed, failed ? 1 : 0, state.closing ? 1 : 0, elapsed, cpu);
+			const unsigned copyFailures = result.copyOrderFailures[0] + result.copyOrderFailures[1] +
+				result.copyOrderFailures[2] + result.copyOrderFailures[3];
+			const bool detected = result.reproFailures || result.mapCasesWithOutsideWrites || result.committedCpuChanged ||
+				result.committedDefaultChanged || result.uploadSourceDamaged || copyFailures;
+			char summary[768];
+			std::snprintf(summary, sizeof(summary), "HOST_FINISHED ran=%u reproFailures=%u mapCasesRun=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u committedDefaultChanged=%u copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u failed=%u closed=%u wallSeconds=%.3f cpuSeconds=%.3f",
+				ran ? 1u : 0u, result.reproFailures, result.mapCasesRun, result.mapCasesWithOutsideWrites, result.unavailableCases,
+				result.committedCpuChanged, result.committedDefaultChanged, result.copyOrderFailures[0], result.copyOrderFailures[1],
+				result.copyOrderFailures[2], result.copyOrderFailures[3], result.selfTestsFailed, failed ? 1 : 0, state.closing ? 1 : 0, elapsed, cpu);
 			Log(nullptr, summary);
 			if (!state.closing && SUCCEEDED(apartment.result))
 			{
-				std::wstring text = (failed || selfTestsFailed) ? L"The tests finished with an error. " :
-					(mismatches ? L"The tests detected changed memory. " : L"The tests completed without detected memory changes. ");
-				text += L"Cases: " + std::to_wstring(cases) + L". Mismatch cases: " + std::to_wstring(mismatches) +
-					L". Unavailable cases: " + std::to_wstring(unavailable) +
+				std::wstring text = (failed || result.selfTestsFailed) ? L"The tests finished with an error. " :
+					(detected ? L"The tests detected changed memory. " : L"The tests completed without detected memory changes. ");
+				text += L"Minimal repro failures: " + std::to_wstring(result.reproFailures) +
+					L". Map cases with writes outside the texture: " + std::to_wstring(result.mapCasesWithOutsideWrites) + L" of " + std::to_wstring(result.mapCasesRun) +
+					L". Changed texels in committed CPU-visible tests: " + std::to_wstring(result.committedCpuChanged) +
+					L". Copy-order failures: " + std::to_wstring(copyFailures) +
+					L". Unavailable: " + std::to_wstring(result.unavailableCases) +
 					L". Retrieve placement-isolation-log.txt from this app's LocalState folder using Xbox Device Portal. You may now close the app.";
 				auto completeText = ref new String(text.c_str());
 				dispatcher->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([this, completeText] {

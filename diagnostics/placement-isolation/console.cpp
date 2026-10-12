@@ -63,6 +63,7 @@ void Log(void* context, const char* line)
 int main(int argc, char** argv)
 {
 	rrdiag::Options options;
+	bool reproOnly = false;
 	for (int i = 1; i < argc; ++i)
 	{
 		if (!std::strcmp(argv[i], "--warp")) options.warp = true;
@@ -71,8 +72,19 @@ int main(int argc, char** argv)
 		else if (!std::strcmp(argv[i], "--gpu-validation")) options.gpuValidation = true;
 		else if (!std::strcmp(argv[i], "--dred-on")) options.dredEnabled = true;
 		else if (!std::strcmp(argv[i], "--dred-off")) options.dredEnabled = false;
-		else if (!std::strcmp(argv[i], "--negative-sentinel")) options.injection = rrdiag::Injection::SentinelFirstWordZero;
-		else if (!std::strcmp(argv[i], "--negative-owner")) options.injection = rrdiag::Injection::OwnerLastWordZero;
+		else if (!std::strcmp(argv[i], "--legacy-suite")) options.legacySuite = true;
+		else if (!std::strcmp(argv[i], "--repro-only")) reproOnly = true;
+		else if (!std::strcmp(argv[i], "--negative-map-outside")) options.injection = rrdiag::Injection::MapOutsideWord;
+		else if (!std::strcmp(argv[i], "--negative-sentinel"))
+		{
+			options.injection = rrdiag::Injection::SentinelFirstWordZero;
+			options.legacySuite = true;
+		}
+		else if (!std::strcmp(argv[i], "--negative-owner"))
+		{
+			options.injection = rrdiag::Injection::OwnerLastWordZero;
+			options.legacySuite = true;
+		}
 		else if (!std::strcmp(argv[i], "--repeats") && i + 1 < argc)
 		{
 			char* end = nullptr;
@@ -88,7 +100,43 @@ int main(int argc, char** argv)
 	}
 
 	LogState log;
+	if (reproOnly)
+	{
+		// Just the self-contained minimal reproduction on its own device.
+		rrdiag::ReproStatus status;
+		const int failures = rrdiag::RunMinimalRepro(Log, &log, options.warp, &status);
+		return failures || status.deviceFailed ? 1 : 0;
+	}
 	const rrdiag::Result result = rrdiag::Run(options, Log, &log);
+	if (!options.legacySuite)
+	{
+		const unsigned copyFailures = result.copyOrderFailures[0] + result.copyOrderFailures[1] +
+			result.copyOrderFailures[2] + result.copyOrderFailures[3];
+		std::printf("HOST_RESULT reproFailures=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u "
+			"copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u deviceFailed=%u mapCasesRun=%u committedDefaultChanged=%u "
+			"uploadSourceDamaged=%u injectionsAttempted=%u injectionsDetected=%u debugErrors=%u\n",
+			result.reproFailures, result.mapCasesWithOutsideWrites, result.unavailableCases, result.committedCpuChanged,
+			result.copyOrderFailures[0], result.copyOrderFailures[1], result.copyOrderFailures[2], result.copyOrderFailures[3],
+			result.selfTestsFailed, result.deviceFailed ? 1 : 0, result.mapCasesRun, result.committedDefaultChanged,
+			result.uploadSourceDamaged, result.injectionsAttempted, result.injectionsDetected, result.debugErrors ? 1 : 0);
+		const bool clean = !result.deviceFailed && !result.debugErrors && !result.selfTestsFailed;
+		if (options.injection == rrdiag::Injection::MapOutsideWord)
+		{
+			// Every map case was corrupted by the harness; each must be reported exactly once.
+			if (clean && !result.reproFailures && !copyFailures && !result.committedCpuChanged && result.injectionsAttempted &&
+				result.injectionsDetected == result.injectionsAttempted && result.mapCasesRun == result.injectionsAttempted &&
+				result.mapCasesWithOutsideWrites == result.injectionsAttempted)
+			{
+				std::puts("NEGATIVE_ORACLE_REJECTED:isolation-map-outside");
+				return 2;
+			}
+			std::puts("NEGATIVE_ORACLE_INVALID");
+			return 3;
+		}
+		// Hardware runs are expected to report the driver defect; WARP must be clean.
+		return clean && result.mapCasesRun && !result.reproFailures && !result.mapCasesWithOutsideWrites &&
+			!result.committedCpuChanged && !result.committedDefaultChanged && !result.uploadSourceDamaged && !copyFailures ? 0 : 1;
+	}
 	std::printf("HOST_RESULT cases=%u mismatches=%u unavailable=%u selfTestsFailed=%u deviceFailed=%u debugErrors=%u\n",
 		result.casesCompleted, result.mismatchCases, result.unavailableCases,
 		result.selfTestsFailed, result.deviceFailed ? 1 : 0, result.debugErrors ? 1 : 0);
