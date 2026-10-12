@@ -28,6 +28,22 @@ The log is written to the app's local state. Send that single file with a note
 of the Xbox model and OS/build. Do not close the app before the completion
 summary appears; an interrupted run leaves an incomplete log.
 
+## Build from source
+
+Use an x64 Visual Studio 2022 developer shell with C++ UWP support, Windows SDK
+tools (`fxc`, `MakePri`, `MakeAppx`, and `SignTool`), and the Microsoft VCLibs
+14.0 extension SDK. The build script finds the retail x64 dependency through
+the installed SDK manifest and validates its UWP framework identity before
+including it in the install artifact.
+
+```powershell
+python tests/prepare-source.py build/probe-source
+./diagnostics/placement-isolation/build.ps1 -Engine build/probe-source
+```
+
+The default output is `build/placement-isolation/install/`, with full WARP logs
+in `build/placement-isolation/logs/`.
+
 ## What the matrix compares
 
 Each observer uses an independent fresh fixture. The shader observer keeps

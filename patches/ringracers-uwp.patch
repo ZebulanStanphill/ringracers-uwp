@@ -1,4 +1,4 @@
-From 1288a04b14913d950e839fa6801eb8244417852b Mon Sep 17 00:00:00 2001
+From 50fb0f5f1a09456318d9b4c4dddda02bc5db8965 Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -678,6 +678,15 @@ Model: gpt-6.1-sol
 Agent: Codex (/root/canary_code_review, isolation review)
 Model: gpt-6.1-sol
 Agent: Codex (/root/isolation_export, patch export)
+Model: gpt-6-luna
+
+- [UWP]: Find the standalone isolation app's x64 VCLibs dependency through the installed extension SDK manifest and validate package metadata, architecture, framework identity and minimum version. Engine source is unchanged.
+
+Agent: Codex (/root, diagnosis and review)
+Model: gpt-6.1-sol
+Agent: Codex (/root/isolation_host, implementation and checks)
+Model: gpt-6.1-sol
+Agent: Codex (/root/isolation_export, commit preparation)
 Model: gpt-6-luna
 ---
  CMakeLists.txt                                |   19 +-

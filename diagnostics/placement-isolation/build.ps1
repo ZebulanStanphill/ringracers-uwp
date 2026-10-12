@@ -40,6 +40,70 @@ function Exec([scriptblock]$Command) {
     if ($LASTEXITCODE -ne 0) { throw "Command failed ($LASTEXITCODE): $Command" }
 }
 
+function Find-VCLibsDependency([string[]]$SdkRoots) {
+    $ExpectedName = 'Microsoft.VCLibs.140.00'
+    $ExpectedPublisher = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US'
+    $Attempted = @()
+    foreach ($Root in @($SdkRoots | Where-Object { $_ } | Select-Object -Unique)) {
+        # ExtensionSdkDir may name either the extension collection or this SDK.
+        $ManifestPath = Join-Path $Root 'Microsoft.VCLibs/14.0/SDKManifest.xml'
+        $DirectManifest = Join-Path $Root 'SDKManifest.xml'
+        if (Test-Path -LiteralPath $DirectManifest -PathType Leaf) { $ManifestPath = $DirectManifest }
+        $Attempted += $ManifestPath
+        if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { continue }
+
+        [xml]$SdkManifest = Get-Content -LiteralPath $ManifestPath -Raw
+        $Sdk = $SdkManifest.DocumentElement
+        $FrameworkIdentity = ''
+        foreach ($Attribute in 'FrameworkIdentity-Retail-x64', 'FrameworkIdentity-Retail', 'FrameworkIdentity') {
+            $FrameworkIdentity = $Sdk.GetAttribute($Attribute)
+            if ($FrameworkIdentity) { break }
+        }
+        $PublisherPattern = [regex]::Escape($ExpectedPublisher)
+        if ($FrameworkIdentity -notmatch '(?:^|,)\s*Name\s*=\s*Microsoft\.VCLibs\.140\.00\s*(?:,|$)' -or
+            $FrameworkIdentity -notmatch "Publisher\s*=\s*['`"]?$PublisherPattern['`"]?\s*$") {
+            throw "SDK manifest does not identify the UWP VCLibs framework: $ManifestPath"
+        }
+        $MinimumVersionMatch = [regex]::Match($FrameworkIdentity, '(?:^|,)\s*MinVersion\s*=\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s*(?:,|$)')
+        if (-not $MinimumVersionMatch.Success) { throw "SDK manifest is missing the framework minimum version: $ManifestPath" }
+        $MinimumVersion = [version]$MinimumVersionMatch.Groups[1].Value
+        $RelativePackage = $Sdk.GetAttribute('AppX-Retail-x64')
+        if (-not $RelativePackage -or [IO.Path]::IsPathRooted($RelativePackage)) {
+            throw "SDK manifest is missing a relative AppX-Retail-x64 path: $ManifestPath"
+        }
+        $SdkDirectory = [IO.Path]::GetFullPath((Split-Path $ManifestPath))
+        $RelativePackage = $RelativePackage.Replace('\', [IO.Path]::DirectorySeparatorChar).Replace('/', [IO.Path]::DirectorySeparatorChar)
+        $PackagePath = [IO.Path]::GetFullPath((Join-Path $SdkDirectory $RelativePackage))
+        $SdkPrefix = $SdkDirectory.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        if (-not $PackagePath.StartsWith($SdkPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-Path -LiteralPath $PackagePath -PathType Leaf)) {
+            throw "SDK x64 retail package is missing or outside its SDK directory: $PackagePath"
+        }
+
+        $DependencyArchive = [IO.Compression.ZipFile]::OpenRead($PackagePath)
+        try {
+            $Entry = $DependencyArchive.GetEntry('AppxManifest.xml')
+            if (-not $Entry -or -not $DependencyArchive.GetEntry('AppxSignature.p7x')) {
+                throw "VCLibs package is missing its manifest or signature: $PackagePath"
+            }
+            $Reader = [IO.StreamReader]::new($Entry.Open())
+            try { [xml]$DependencyManifest = $Reader.ReadToEnd() } finally { $Reader.Dispose() }
+            $Identity = $DependencyManifest.SelectSingleNode("/*[local-name()='Package']/*[local-name()='Identity']")
+            $Framework = $DependencyManifest.SelectSingleNode("/*[local-name()='Package']/*[local-name()='Properties']/*[local-name()='Framework']")
+            $Universal = $DependencyManifest.SelectSingleNode("/*[local-name()='Package']/*[local-name()='Dependencies']/*[local-name()='TargetDeviceFamily'][@Name='Windows.Universal']")
+            if (-not $Identity -or $Identity.GetAttribute('Name') -cne $ExpectedName -or
+                $Identity.GetAttribute('Publisher') -cne $ExpectedPublisher -or $Identity.GetAttribute('ProcessorArchitecture') -cne 'x64' -or
+                [version]$Identity.GetAttribute('Version') -lt $MinimumVersion -or
+                -not $Framework -or $Framework.InnerText.Trim() -ine 'true' -or -not $Universal) {
+                throw "SDK package is not the expected x64 UWP VCLibs framework: $PackagePath"
+            }
+        } finally { $DependencyArchive.Dispose() }
+        Write-Host "Validated x64 UWP VCLibs dependency from $ManifestPath"
+        return $PackagePath
+    }
+    throw "The x64 UWP VCLibs SDK was not found. Checked: $($Attempted -join '; ')"
+}
+
 foreach ($Entry in 'ObserveBytes', 'ObserveUInt') {
     Exec { fxc.exe /nologo /O3 /T cs_5_0 /E $Entry /Vn "g_$Entry" /Fh (Join-Path $Shaders "$Entry.h") (Join-Path $Core 'observe.hlsl') }
 }
@@ -231,11 +295,13 @@ The wrapper is based on https://github.com/worleydl/ringracers-uwp
 Upstream Ring Racers: https://github.com/KartKrewDev/RingRacers
 '@ | Set-Content -Encoding utf8 (Join-Path $Stage 'Licenses/NOTICE.txt')
 
-$VCLibsRoot = Join-Path $env:VSINSTALLDIR 'SDKs/Microsoft.VCLibs/14.0/Appx/Retail/x64'
-$VCLibs = @(Get-ChildItem $VCLibsRoot -Filter 'Microsoft.VCLibs.x64.14.00.appx' -ErrorAction Stop)
-if ($VCLibs.Count -ne 1) { throw 'The x64 UWP VCLibs dependency was not found in Visual Studio.' }
+$VCLibsSdkRoots = @()
+if ($env:ExtensionSdkDir) { $VCLibsSdkRoots += $env:ExtensionSdkDir.Split(';', [StringSplitOptions]::RemoveEmptyEntries) }
+if (${env:ProgramFiles(x86)}) { $VCLibsSdkRoots += Join-Path ${env:ProgramFiles(x86)} 'Microsoft SDKs/Windows Kits/10/ExtensionSDKs' }
+if ($env:VSINSTALLDIR) { $VCLibsSdkRoots += Join-Path $env:VSINSTALLDIR 'SDKs' }
+$VCLibs = Find-VCLibsDependency $VCLibsSdkRoots
 New-Item -ItemType Directory -Force (Join-Path $Install 'Dependencies/x64') | Out-Null
-Copy-Item $VCLibs[0].FullName (Join-Path $Install 'Dependencies/x64') -Force
+Copy-Item -LiteralPath $VCLibs -Destination (Join-Path $Install 'Dependencies/x64') -Force
 
 $Package = Join-Path $Install 'RingRacersD3D12Isolation_1.0.0.0_x64.msix'
 $PriConfig = Join-Path $Output 'priconfig.xml'
