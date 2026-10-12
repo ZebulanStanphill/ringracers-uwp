@@ -1,0 +1,54 @@
+name: D3D12 placement isolation
+
+on:
+  push:
+    branches: [d3d12-placement-isolation]
+  workflow_dispatch:
+
+jobs:
+  isolation:
+    name: WARP isolation and standalone Xbox package
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up x64 MSVC and Windows SDK
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or !$vs) { throw "Visual Studio C++ tools were not found" }
+          $before = [Environment]::GetEnvironmentVariables('Process')
+          & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          Get-Command cl.exe, fxc.exe, msbuild.exe, MakeAppx.exe, MakePri.exe, SignTool.exe -ErrorAction Stop | Select-Object Name, Source
+          foreach ($entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()) {
+            if ($before[$entry.Key] -cne $entry.Value) {
+              "$($entry.Key)=$($entry.Value)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+
+      - name: Prepare patched SDK-only core source
+        shell: pwsh
+        run: |
+          python tests/prepare-source.py build/probe-source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build, verify and package isolation app
+        shell: pwsh
+        run: ./diagnostics/placement-isolation/build.ps1 -Engine build/probe-source
+
+      - name: Upload WARP observations and negative-control logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: d3d12-placement-isolation-warp-logs
+          path: build/placement-isolation/logs/
+          if-no-files-found: warn
+
+      - name: Upload installable standalone Xbox test
+        uses: actions/upload-artifact@v7
+        with:
+          name: d3d12-placement-isolation
+          path: build/placement-isolation/install/
+          if-no-files-found: error

@@ -1,4 +1,4 @@
-From 0267ff37eb6d5af81d960e76e6ba67333221f225 Mon Sep 17 00:00:00 2001
+From 1288a04b14913d950e839fa6801eb8244417852b Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -668,6 +668,17 @@ Agent: Codex (/root/canary_code_review, placement diagnostic review)
 Model: gpt-6.1-sol
 Agent: Codex (/root/placement_probe_docs, documentation and patch export)
 Model: gpt-6-luna
+
+- [UWP]: Add a standalone SDK-only D3D12 placement isolation core for the separate Xbox diagnostic host.
+
+Agent: Codex (/root, isolation design and review)
+Model: gpt-6.1-sol
+Agent: Codex (/root/isolation_core, SDK-only core implementation)
+Model: gpt-6.1-sol
+Agent: Codex (/root/canary_code_review, isolation review)
+Model: gpt-6.1-sol
+Agent: Codex (/root/isolation_export, patch export)
+Model: gpt-6-luna
 ---
  CMakeLists.txt                                |   19 +-
  CMakePresets.json                             |   17 +
@@ -724,6 +735,9 @@ Model: gpt-6-luna
  src/hardware/r_d3d12/d3d12_screens.inc        |  580 ++
  src/hardware/r_d3d12/d3d12_upload.cpp         |  112 +
  src/hardware/r_d3d12/d3d12_upload.h           |   54 +
+ src/hardware/r_d3d12/isolation/isolation.cpp  |  456 ++
+ src/hardware/r_d3d12/isolation/isolation.h    |   17 +
+ src/hardware/r_d3d12/isolation/observe.hlsl   |   18 +
  src/hardware/r_d3d12/mips.h                   |   60 +
  src/hardware/r_d3d12/pipeline_key.h           |   51 +
  src/hardware/r_d3d12/r_d3d12.cpp              | 3178 ++++++++
@@ -784,7 +798,7 @@ Model: gpt-6-luna
  src/w_wad.cpp                                 |  312 +
  src/w_wad.h                                   |   11 +
  src/z_zone.cpp                                |    5 +
- 115 files changed, 24872 insertions(+), 1137 deletions(-)
+ 118 files changed, 25363 insertions(+), 1137 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -813,6 +827,9 @@ Model: gpt-6-luna
  create mode 100644 src/hardware/r_d3d12/d3d12_screens.inc
  create mode 100644 src/hardware/r_d3d12/d3d12_upload.cpp
  create mode 100644 src/hardware/r_d3d12/d3d12_upload.h
+ create mode 100644 src/hardware/r_d3d12/isolation/isolation.cpp
+ create mode 100644 src/hardware/r_d3d12/isolation/isolation.h
+ create mode 100644 src/hardware/r_d3d12/isolation/observe.hlsl
  create mode 100644 src/hardware/r_d3d12/mips.h
  create mode 100644 src/hardware/r_d3d12/pipeline_key.h
  create mode 100644 src/hardware/r_d3d12/r_d3d12.cpp
@@ -21504,6 +21521,515 @@ index 0000000..4171b1c
 +};
 +}
 +#endif
+diff --git a/src/hardware/r_d3d12/isolation/isolation.cpp b/src/hardware/r_d3d12/isolation/isolation.cpp
+new file mode 100644
+index 0000000..3be64f0
+--- /dev/null
++++ b/src/hardware/r_d3d12/isolation/isolation.cpp
+@@ -0,0 +1,456 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Windows SDK and C++ standard library only. Each invocation owns a fresh device.
++#include "isolation.h"
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <d3d12.h>
++#include <dxgi1_4.h>
++#include <d3d12sdklayers.h>
++#include <wrl/client.h>
++#include <algorithm>
++#include <climits>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <vector>
++#include "isolation_shaders/ObserveBytes.h"
++#include "isolation_shaders/ObserveUInt.h"
++namespace rrdiag { namespace {
++using Microsoft::WRL::ComPtr;
++using U64=unsigned long long;
++constexpr UINT Prefix=512, Tail=65536;
++U64 align(U64 x,U64 a) { return (x+a-1)&~(a-1); }
++D3D12_HEAP_PROPERTIES props(D3D12_HEAP_TYPE type) {
++ D3D12_HEAP_PROPERTIES p={}; p.Type=type; p.CreationNodeMask=p.VisibleNodeMask=1; return p;
++}
++D3D12_RESOURCE_DESC buffer(U64 bytes,D3D12_RESOURCE_FLAGS flags=D3D12_RESOURCE_FLAG_NONE) {
++ D3D12_RESOURCE_DESC d={}; d.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; d.Width=bytes;
++ d.Height=1; d.DepthOrArraySize=1; d.MipLevels=1; d.SampleDesc.Count=1;
++ d.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR; d.Flags=flags; return d;
++}
++D3D12_RESOURCE_DESC texture(UINT w,UINT h,DXGI_FORMAT f,bool smallPlacement) {
++ D3D12_RESOURCE_DESC d={}; d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++ d.Alignment=smallPlacement?4096:0; d.Width=w; d.Height=h; d.DepthOrArraySize=1;
++ d.MipLevels=1; d.Format=f; d.SampleDesc.Count=1; return d;
++}
++const char* stateName(D3D12_RESOURCE_STATES s) {
++ switch(s) { case D3D12_RESOURCE_STATE_COMMON:return "COMMON";
++ case D3D12_RESOURCE_STATE_COPY_DEST:return "COPY_DEST";
++ case D3D12_RESOURCE_STATE_COPY_SOURCE:return "COPY_SOURCE";
++ case D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE:return "PIXEL_SHADER_RESOURCE";
++ case D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE:return "NON_PIXEL_SHADER_RESOURCE";
++ default:return "OTHER"; }
++}
++const char* formatName(DXGI_FORMAT f) { return f==DXGI_FORMAT_R8_UNORM?"R8":f==DXGI_FORMAT_R32_UINT?"R32_UINT":"RGBA8"; }
++UINT bytesPerPixel(DXGI_FORMAT f) { return f==DXGI_FORMAT_R8_UNORM?1:4; }
++UINT word(UINT i,DXGI_FORMAT f) {
++ // Include exact packing self-test values as well as asymmetric, nonzero texels.
++ const UINT special[]={0x7f3bc119,0,0xffffffff,0x01020408,0x80402010};
++ UINT v=i<5?special[i]:((i*1664525u+1013904223u)^0x91b7e32du);
++ return f==DXGI_FORMAT_R8_UNORM?v&255:v;
++}
++U64 hash(const std::vector<UINT>& v) { U64 h=14695981039346656037ull;
++ for(UINT x:v) for(int b=0;b<4;++b) { h^=(x>>(b*8))&255; h*=1099511628211ull; } return h; }
++struct Context {
++ Options options; Result result; LogSink sink; void* user;
++ ComPtr<IDXGIFactory4> factory; ComPtr<IDXGIAdapter1> adapter; ComPtr<ID3D12Device> device;
++ ComPtr<ID3D12CommandQueue> queue; ComPtr<ID3D12CommandAllocator> allocator;
++ ComPtr<ID3D12GraphicsCommandList> list; ComPtr<ID3D12Fence> fence;
++ ComPtr<ID3D12InfoQueue> info; ComPtr<ID3D12RootSignature> root;
++ ComPtr<ID3D12PipelineState> bytesPSO,uintPSO;
++ HANDLE event=nullptr; U64 serial=0; bool recording=false,fatal=false,compute=false;
++ bool coherent=false,tier2=false; UINT descriptorSize=0;
++ // Retain every GPU object until the device is idle. On fatal timeout, Run leaks
++ // this entire context deliberately; objects referenced by pending work survive.
++ std::vector<ComPtr<IUnknown>> retained;
++ Context(const Options&o,LogSink s,void*u):options(o),sink(s),user(u){}
++ ~Context() { if(event) CloseHandle(event); }
++ void log(const char*fmt,...) { char text[4096]; va_list ap; va_start(ap,fmt);
++ vsnprintf(text,sizeof(text),fmt,ap); va_end(ap); if(sink) sink(user,text); }
++ bool checked(HRESULT hr,const char*api,bool deviceFailure=true) {
++ if(SUCCEEDED(hr)) return true;
++ log("API_FAILURE api=%s hr=0x%08lx",api,(unsigned long)hr);
++ if(deviceFailure) { fatal=true; result.deviceFailed=true;
++ if(device) log("DEVICE_REMOVED reason=0x%08lx",(unsigned long)device->GetDeviceRemovedReason()); }
++ return false;
++ }
++ template<class T> void keep(const ComPtr<T>& p) { if(p) { ComPtr<IUnknown> x; p.As(&x); retained.push_back(x); } }
++ bool begin() { if(fatal) return false;
++ if(!checked(allocator->Reset(),"Allocator.Reset") || !checked(list->Reset(allocator.Get(),nullptr),"List.Reset"))return false;
++ recording=true; return true; }
++ bool submit(const char*phase) { if(fatal)return false;
++ if(!checked(list->Close(),"List.Close"))return false; recording=false;
++ ID3D12CommandList* lists[]={list.Get()}; queue->ExecuteCommandLists(1,lists);
++ ++serial; if(!checked(queue->Signal(fence.Get(),serial),"Queue.Signal"))return false;
++ if(fence->GetCompletedValue()!=UINT64_MAX && fence->GetCompletedValue()<serial) {
++ if(!checked(fence->SetEventOnCompletion(serial,event),"Fence.SetEventOnCompletion"))return false;
++ DWORD wait=WaitForSingleObjectEx(event,5000,FALSE);
++ if(wait!=WAIT_OBJECT_0) { log("FATAL_WAIT phase=%s fence=%llu wait=%lu timeoutMs=5000 pendingResourcesRetained=1",phase,serial,(unsigned long)wait);
++ fatal=true;result.deviceFailed=true; return false; }
++ }
++ if(fence->GetCompletedValue()==UINT64_MAX || FAILED(device->GetDeviceRemovedReason())) {
++ checked(DXGI_ERROR_DEVICE_REMOVED,"Fence/device removal"); return false; }
++ log("FENCE phase=%s value=%llu complete=%llu",phase,serial,fence->GetCompletedValue());
++ inspectDebug();return true;
++ }
++ void inspectDebug() { if(!info)return;
++ U64 n=info->GetNumStoredMessagesAllowedByRetrievalFilter();
++ for(U64 i=0;i<n;++i) { SIZE_T size=0; info->GetMessage(i,nullptr,&size);
++ std::vector<unsigned char> storage(size); auto m=reinterpret_cast<D3D12_MESSAGE*>(storage.data());
++ if(SUCCEEDED(info->GetMessage(i,m,&size))) {
++ if(m->Severity==D3D12_MESSAGE_SEVERITY_ERROR||m->Severity==D3D12_MESSAGE_SEVERITY_CORRUPTION)result.debugErrors=true;
++ log("DEBUG severity=%u id=%u text=%s",(UINT)m->Severity,(UINT)m->ID,m->pDescription); }
++ } info->ClearStoredMessages(); }
++ void transition(ID3D12Resource*r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b) {
++ if(a==b)return; D3D12_RESOURCE_BARRIER x={}; x.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++ x.Transition.pResource=r;x.Transition.StateBefore=a;x.Transition.StateAfter=b;x.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++ list->ResourceBarrier(1,&x);
++ }
++ void activate(ID3D12Resource*r) { D3D12_RESOURCE_BARRIER x={};x.Type=D3D12_RESOURCE_BARRIER_TYPE_ALIASING;x.Aliasing.pResourceAfter=r;list->ResourceBarrier(1,&x); }
++ ComPtr<ID3D12Resource> makeBuffer(U64 size,D3D12_HEAP_TYPE type,D3D12_RESOURCE_STATES state,D3D12_RESOURCE_FLAGS flags=D3D12_RESOURCE_FLAG_NONE) {
++ ComPtr<ID3D12Resource> r; auto p=props(type); auto d=buffer(size,flags);
++ if(checked(device->CreateCommittedResource(&p,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&r)),"CreateCommittedResource(buffer)")){keep(r);auto a=device->GetResourceAllocationInfo(0,1,&d);log("BUFFER type=%u descWidth=%llu allocationSize=%llu allocationAlignment=%llu initialState=%s flags=%u",(UINT)type,size,a.SizeInBytes,a.Alignment,stateName(state),(UINT)flags);}return r;
++ }
++ bool fill(ID3D12Resource*r,const std::vector<unsigned char>& data) {
++ void*p=nullptr; D3D12_RANGE read={0,0};if(!checked(r->Map(0,&read,&p),"Upload.Map"))return false;
++ memcpy(p,data.data(),data.size());bool equal=memcmp(p,data.data(),data.size())==0;
++ log("UPLOAD_INITIAL_CPU_VERIFY bytes=%llu result=%s sameMapAfterWrite=1",(U64)data.size(),equal?"pass":"FAIL");if(!equal)++result.selfTestsFailed;
++ D3D12_RANGE wrote={0,data.size()};r->Unmap(0,&wrote);return true;
++ }
++ bool read(ID3D12Resource*r,U64 size,std::vector<unsigned char>& data) {
++ void*p=nullptr;D3D12_RANGE range={0,(SIZE_T)size};if(!checked(r->Map(0,&range,&p),"Readback.Map"))return false;
++ data.assign((unsigned char*)p,(unsigned char*)p+size);D3D12_RANGE noWrite={0,0};r->Unmap(0,&noWrite);return true;
++ }
++ bool initialize();
++};
++bool Context::initialize() {
++ log("RRDIAG BEGIN warp=%u debug=%u gbv=%u dred=%u quick=%u repeats=%u injection=%u",options.warp,options.debug,options.gpuValidation,options.dredEnabled,options.quick,options.repeats,(UINT)options.injection);
++ bool appliedDebug=false,appliedGBV=false,appliedDred=false;
++ if(options.debug||options.gpuValidation) {
++ ComPtr<ID3D12Debug> debug;
++ if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
++ debug->EnableDebugLayer();appliedDebug=true;
++ if(options.gpuValidation) { ComPtr<ID3D12Debug1> d1;if(SUCCEEDED(debug.As(&d1))) {d1->SetEnableGPUBasedValidation(TRUE);appliedGBV=true;} }
++ }
++ }
++#if defined(__ID3D12DeviceRemovedExtendedDataSettings_INTERFACE_DEFINED__)
++ ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred;
++ if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred)))) {
++ auto setting=options.dredEnabled?D3D12_DRED_ENABLEMENT_FORCED_ON:D3D12_DRED_ENABLEMENT_FORCED_OFF;
++ dred->SetAutoBreadcrumbsEnablement(setting);dred->SetPageFaultEnablement(setting);appliedDred=true;
++ }
++#endif
++ log("SETTINGS debugRequested=%u debugApplied=%u gbvRequested=%u gbvApplied=%u dredRequested=%u dredApplied=%u configuredBeforeDevice=1",options.debug,appliedDebug,options.gpuValidation,appliedGBV,options.dredEnabled,appliedDred);
++ HRESULT factoryHR=CreateDXGIFactory2(appliedDebug?DXGI_CREATE_FACTORY_DEBUG:0,IID_PPV_ARGS(&factory));
++ if(FAILED(factoryHR)&&appliedDebug){log("UNAVAILABLE DXGI factory debug flag hr=0x%08lx retryWithoutFlag=1",(unsigned long)factoryHR);factoryHR=CreateDXGIFactory2(0,IID_PPV_ARGS(&factory));}
++ if(!checked(factoryHR,"CreateDXGIFactory2"))return false;
++ if(options.warp) { if(!checked(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)),"EnumWarpAdapter"))return false; }
++ else { for(UINT i=0;;++i) { ComPtr<IDXGIAdapter1> a;HRESULT hr=factory->EnumAdapters1(i,&a);
++ if(hr==DXGI_ERROR_NOT_FOUND)break;if(FAILED(hr))continue;DXGI_ADAPTER_DESC1 d={};a->GetDesc1(&d);
++ if(d.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)continue;
++ if(SUCCEEDED(D3D12CreateDevice(a.Get(),D3D_FEATURE_LEVEL_11_0,__uuidof(ID3D12Device),nullptr))) {adapter=a;break;} }
++ if(!adapter) {log("UNAVAILABLE no hardware D3D12 adapter; explicit WARP option required");++result.unavailableCases;return false;}
++ }
++ DXGI_ADAPTER_DESC1 ad={};adapter->GetDesc1(&ad);char desc[256]={};WideCharToMultiByte(CP_UTF8,0,ad.Description,-1,desc,sizeof(desc),nullptr,nullptr);
++ log("ADAPTER description=%s luid=%08lx:%08lx vendor=%04x device=%04x subsystem=%08x revision=%u dedicatedVideo=%llu shared=%llu mode=%s",desc,(unsigned long)ad.AdapterLuid.HighPart,(unsigned long)ad.AdapterLuid.LowPart,ad.VendorId,ad.DeviceId,ad.SubSysId,ad.Revision,(U64)ad.DedicatedVideoMemory,(U64)ad.SharedSystemMemory,options.warp?"WARP":"hardware");
++ if(!checked(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),"D3D12CreateDevice"))return false;
++ if(appliedDebug)device.As(&info);
++ D3D12_FEATURE_DATA_ARCHITECTURE arch={};HRESULT ah=device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE,&arch,sizeof(arch));
++ D3D12_FEATURE_DATA_D3D12_OPTIONS capabilities={};HRESULT oh=device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,&capabilities,sizeof(capabilities));
++ coherent=SUCCEEDED(ah)&&arch.UMA&&arch.CacheCoherentUMA;tier2=SUCCEEDED(oh)&&capabilities.ResourceHeapTier==D3D12_RESOURCE_HEAP_TIER_2;
++ D3D_FEATURE_LEVEL levels[]={D3D_FEATURE_LEVEL_12_1,D3D_FEATURE_LEVEL_12_0,D3D_FEATURE_LEVEL_11_1,D3D_FEATURE_LEVEL_11_0};
++ D3D12_FEATURE_DATA_FEATURE_LEVELS fl={4,levels,D3D_FEATURE_LEVEL_11_0};device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS,&fl,sizeof(fl));
++ log("CAPABILITIES featureLevel=0x%x architectureHr=0x%08lx UMA=%u cacheCoherentUMA=%u heapTier=%u bindingTier=%u optionsHr=0x%08lx",fl.MaxSupportedFeatureLevel,(unsigned long)ah,arch.UMA,arch.CacheCoherentUMA,(UINT)capabilities.ResourceHeapTier,(UINT)capabilities.ResourceBindingTier,(unsigned long)oh);
++#if defined(__ID3D12Device1_INTERFACE_DEFINED__)
++ D3D12_FEATURE_DATA_SHADER_MODEL sm={D3D_SHADER_MODEL_5_1};HRESULT sh=device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL,&sm,sizeof(sm));
++ log("SHADER_MODEL hr=0x%08lx highest=0x%x shaderBytecode=cs_5_0",(unsigned long)sh,(UINT)sm.HighestShaderModel);
++#else
++ log("SHADER_MODEL query=unavailable shaderBytecode=cs_5_0");
++#endif
++ D3D12_COMMAND_QUEUE_DESC q={};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
++ if(!checked(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue)),"CreateCommandQueue")||!checked(device->CreateCommandAllocator(q.Type,IID_PPV_ARGS(&allocator)),"CreateCommandAllocator")||!checked(device->CreateCommandList(0,q.Type,allocator.Get(),nullptr,IID_PPV_ARGS(&list)),"CreateCommandList")||!checked(list->Close(),"InitialList.Close")||!checked(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"CreateFence"))return false;
++ event=CreateEventExW(nullptr,nullptr,0,EVENT_ALL_ACCESS);if(!event){checked(HRESULT_FROM_WIN32(GetLastError()),"CreateEvent");return false;}
++ D3D12_DESCRIPTOR_RANGE ranges[2]={};ranges[0].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;ranges[1].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
++ for(auto&r:ranges){r.NumDescriptors=1;r.OffsetInDescriptorsFromTableStart=D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;}
++ D3D12_ROOT_PARAMETER parameters[3]={};parameters[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;parameters[0].Constants.Num32BitValues=4;
++ for(UINT i=0;i<2;++i){parameters[i+1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;parameters[i+1].DescriptorTable.NumDescriptorRanges=1;parameters[i+1].DescriptorTable.pDescriptorRanges=&ranges[i];}
++ D3D12_ROOT_SIGNATURE_DESC rd={};rd.NumParameters=3;rd.pParameters=parameters;
++ ComPtr<ID3DBlob> blob,error;HRESULT rh=D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error);
++ if(SUCCEEDED(rh))rh=device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root));
++ if(SUCCEEDED(rh)) {D3D12_COMPUTE_PIPELINE_STATE_DESC p={};p.pRootSignature=root.Get();p.CS={g_ObserveBytes,sizeof(g_ObserveBytes)};
++ rh=device->CreateComputePipelineState(&p,IID_PPV_ARGS(&bytesPSO));
++ if(SUCCEEDED(rh)) {p.CS={g_ObserveUInt,sizeof(g_ObserveUInt)};rh=device->CreateComputePipelineState(&p,IID_PPV_ARGS(&uintPSO));}}
++ compute=SUCCEEDED(rh);descriptorSize=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++ log("COMPUTE available=%u hr=0x%08lx",compute,(unsigned long)rh);inspectDebug();return true;
++}
++struct Image {
++ ComPtr<ID3D12Resource> resource,upload;
++ D3D12_RESOURCE_DESC desc={};D3D12_RESOURCE_ALLOCATION_INFO allocation={};
++ D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint={};U64 total=0;
++ D3D12_RESOURCE_STATES state=D3D12_RESOURCE_STATE_COMMON;
++ std::vector<unsigned char> staging;
++ UINT w=0,h=0,bpp=0;DXGI_FORMAT format=DXGI_FORMAT_UNKNOWN;
++};
++void describe(Context&c,const char*name,Image&t,U64 offset) {
++ c.log("RESOURCE target=%s width=%u height=%u format=%s requestedAlignment=%llu allocationSize=%llu allocationAlignment=%llu heapOffset=%llu range=[%llu,%llu) initialState=%s footprintOffset=%llu rowPitch=%u totalFootprint=%llu payloadPrefix=%u paddedTail=%u",name,t.w,t.h,formatName(t.format),t.desc.Alignment,t.allocation.SizeInBytes,t.allocation.Alignment,offset,offset,offset+t.allocation.SizeInBytes,stateName(t.state),t.footprint.Offset,t.footprint.Footprint.RowPitch,t.total,Prefix,Tail);
++}
++bool prepare(Context&c,Image&t,UINT w,UINT h,DXGI_FORMAT f,bool smallPlacement,D3D12_RESOURCE_STATES state) {
++ t.w=w;t.h=h;t.format=f;t.bpp=bytesPerPixel(f);t.state=state;t.desc=texture(w,h,f,smallPlacement);
++ t.allocation=c.device->GetResourceAllocationInfo(0,1,&t.desc);
++ if(t.allocation.SizeInBytes==UINT64_MAX||t.allocation.Alignment==0){c.log("UNAVAILABLE allocation width=%u format=%s smallPlacement=%u",w,formatName(f),smallPlacement);return false;}
++ UINT rows=0;U64 rowSize=0;c.device->GetCopyableFootprints(&t.desc,0,1,0,&t.footprint,&rows,&rowSize,&t.total);
++ t.staging.assign((size_t)t.total,0xa5);
++ for(UINT y=0;y<h;++y)for(UINT x=0;x<w;++x){UINT v=word(y*w+x,f);memcpy(&t.staging[(size_t)t.footprint.Offset+y*t.footprint.Footprint.RowPitch+x*t.bpp],&v,t.bpp);}
++ t.upload=c.makeBuffer(t.total,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);return t.upload&&c.fill(t.upload.Get(),t.staging);
++}
++bool rawControl(Context&c,Image&t,const char*target) {
++ // Map/remap is itself under investigation. Never remap the upload used by
++ // the later texture upload; a separate identical buffer exercises transport.
++ auto controlUpload=c.makeBuffer(t.total,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
++ if(!controlUpload||!c.fill(controlUpload.Get(),t.staging))return false;
++ auto exact=c.makeBuffer(t.total,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
++ auto padded=c.makeBuffer(Prefix+t.total+Tail,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
++ auto init=c.makeBuffer(Prefix+t.total+Tail,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
++ std::vector<unsigned char> guards(Prefix+(size_t)t.total+Tail,0x6d);if(!exact||!padded||!init||!c.fill(init.Get(),guards)||!c.begin())return false;
++ c.list->CopyBufferRegion(padded.Get(),0,init.Get(),0,guards.size());
++ c.list->CopyBufferRegion(exact.Get(),0,controlUpload.Get(),0,t.total);c.list->CopyBufferRegion(padded.Get(),Prefix,controlUpload.Get(),0,t.total);
++ if(!c.submit("raw-transport-control"))return false;
++ std::vector<unsigned char>a,b,again,uploadBytes,uploadAgain;if(!c.read(exact.Get(),t.total,a)||!c.read(padded.Get(),guards.size(),b)||!c.read(exact.Get(),t.total,again)||!c.read(controlUpload.Get(),t.total,uploadBytes)||!c.read(controlUpload.Get(),t.total,uploadAgain))return false;
++ bool e=a==t.staging,p=b.size()==guards.size()&&std::equal(t.staging.begin(),t.staging.end(),b.begin()+Prefix),remap=a==again&&uploadBytes==uploadAgain,u=uploadBytes==t.staging&&uploadAgain==t.staging;
++ bool guard=true;for(size_t i=0;i<b.size();++i)if((i<Prefix||i>=Prefix+t.total)&&b[i]!=0x6d)guard=false;
++ UINT finalWord=0;memcpy(&finalWord,&t.staging[t.footprint.Offset+(t.h-1)*t.footprint.Footprint.RowPitch+(t.w-1)*t.bpp],t.bpp);
++ c.log("RAW_CONTROL target=%s exact=%s padded=%s remap=%s uploadCPU=%s guard=%s separateControlUpload=1 actualTextureUploadRemapped=0 bytes=%llu exactDescWidth=%llu paddedDescWidth=%llu finalPixel=%08x",target,e?"pass":"FAIL",p?"pass":"FAIL",remap?"pass":"FAIL",u?"pass":"FAIL",guard?"pass":"FAIL",t.total,t.total,(U64)b.size(),finalWord);
++ U64 finalOffset=t.footprint.Offset+U64(t.h-1)*t.footprint.Footprint.RowPitch+(t.w-1)*t.bpp;
++ UINT ea=0,pb=0,uc=0;memcpy(&ea,a.data()+finalOffset,t.bpp);memcpy(&pb,b.data()+Prefix+finalOffset,t.bpp);memcpy(&uc,uploadBytes.data()+finalOffset,t.bpp);
++ c.log("RAW_ENDPOINTS target=%s lastTexelExpected=%08x exact=%08x padded=%08x uploadCPU=%08x lastTexelOffset=%llu",target,finalWord,ea,pb,uc,finalOffset);
++ unsigned rawDifferences=0,prefixChanges=0,tailChanges=0;
++ for(size_t i=0;i<t.staging.size();++i)if(a[i]!=t.staging[i]||b[Prefix+i]!=t.staging[i]||uploadBytes[i]!=t.staging[i]){if(rawDifferences<16)c.log("RAW_DIFFERENCE target=%s byteOffset=%llu expected=%02x exact=%02x padded=%02x uploadCPU=%02x",target,(U64)i,t.staging[i],a[i],b[Prefix+i],uploadBytes[i]);++rawDifferences;}
++ for(size_t i=0;i<b.size();++i)if(b[i]!=0x6d){if(i<Prefix)++prefixChanges;else if(i>=Prefix+t.total)++tailChanges;}
++ c.log("RAW_DIFFERENCE_SUMMARY target=%s bytesChanged=%u prefixChanges=%u tailChanges=%u",target,rawDifferences,prefixChanges,tailChanges);
++ if(!(e&&p&&remap&&u&&guard)){++c.result.selfTestsFailed;c.log("CONTROL_FAILURE target=%s continueIndependentObservers=1",target);}return !c.fatal;
++}
++void copyToTexture(Context&c,Image&t) {D3D12_TEXTURE_COPY_LOCATION from={},to={};from.pResource=t.upload.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;from.PlacedFootprint=t.footprint;to.pResource=t.resource.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;c.list->CopyTextureRegion(&to,0,0,0,&from,nullptr);}
++struct Observation { std::vector<UINT> words;unsigned guardChanges=0,prefixChanges=0,tailChanges=0; };
++struct Reader {
++ Context&c;Image&t;bool shader;bool toggle;bool exactFirst;
++ ComPtr<ID3D12Resource> a,b,output,init;
++ ComPtr<ID3D12DescriptorHeap> descriptors;
++ U64 size=0;D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp={};std::vector<unsigned char> guardData;
++ Reader(Context&ctx,Image&image,bool s,bool toggled=false,bool exact=false):c(ctx),t(image),shader(s),toggle(toggled),exactFirst(exact&&!s){}
++ bool initialize() {
++ fp=t.footprint;fp.Offset=Prefix;
++ // Prefix must satisfy the texture footprint's 512-byte placement rule.
++ if(!shader)fp.Offset=512;
++ size=shader?Prefix+U64(t.w)*t.h*4+Tail:fp.Offset+t.total+Tail;
++ a=c.makeBuffer(exactFirst?t.total:size,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
++ b=c.makeBuffer(size,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_STATE_COPY_DEST);
++ init=c.makeBuffer(size,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);
++ guardData.assign((size_t)size,0x6d);
++ if(!a||!b||!init||!c.fill(init.Get(),guardData))return false;
++ if(shader) {
++ if(!c.compute)return false;
++ output=c.makeBuffer(size,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);if(!output)return false;
++ D3D12_DESCRIPTOR_HEAP_DESC hd={};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=2;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++ if(!c.checked(c.device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&descriptors)),"CreateDescriptorHeap"))return false;c.keep(descriptors);
++ D3D12_SHADER_RESOURCE_VIEW_DESC srv={};srv.Format=t.format;srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;srv.Texture2D.MipLevels=1;
++ auto cpu=descriptors->GetCPUDescriptorHandleForHeapStart();c.device->CreateShaderResourceView(t.resource.Get(),&srv,cpu);cpu.ptr+=c.descriptorSize;
++ D3D12_UNORDERED_ACCESS_VIEW_DESC uav={};uav.Format=DXGI_FORMAT_R32_TYPELESS;uav.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;uav.Buffer.NumElements=(UINT)(size/4);uav.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
++ c.device->CreateUnorderedAccessView(output.Get(),nullptr,&uav,cpu);
++ }
++ if(!c.begin())return false;c.list->CopyBufferRegion(a.Get(),0,init.Get(),0,exactFirst?t.total:size);c.list->CopyBufferRegion(b.Get(),0,init.Get(),0,size);
++ if(shader){c.list->CopyBufferRegion(output.Get(),0,init.Get(),0,size);c.transition(output.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);}
++ c.log("OBSERVER_SETUP method=%s descWidth=%llu prefix=%llu tail=%u rowPitch=%u shaderOutputOffset=%u exactFirst=%u",shader?"shader":"texturecopy",size,shader?(U64)Prefix:fp.Offset,Tail,fp.Footprint.RowPitch,Prefix,exactFirst);
++ return c.submit("observer-setup");
++ }
++ Observation unpack(const std::vector<unsigned char>&bytes,bool exact=false) {
++ Observation o;o.words.resize((size_t)t.w*t.h);
++ for(UINT y=0;y<t.h;++y)for(UINT x=0;x<t.w;++x){U64 pos=shader?Prefix+(U64(y)*t.w+x)*4:(exact?0:fp.Offset)+U64(y)*fp.Footprint.RowPitch+x*t.bpp;
++ UINT v=0;UINT n=shader?4:t.bpp;memcpy(&v,bytes.data()+pos,n);o.words[y*t.w+x]=v;
++}
++ // Ignore CopyTextureRegion row padding: the API does not define these bytes.
++ U64 payloadEnd=shader?Prefix+U64(t.w)*t.h*4:fp.Offset+t.total;
++ U64 prefix=shader?Prefix:fp.Offset;
++ for(size_t i=0;!exact&&i<bytes.size();++i)if((i<prefix||i>=payloadEnd)&&bytes[i]!=0x6d){++o.guardChanges;if(i<prefix)++o.prefixChanges;else ++o.tailChanges;}
++ return o;
++ }
++ bool observe(const char*target,const char*phase,bool&bad) {
++ if(!c.begin())return false;
++ D3D12_RESOURCE_STATES before=t.state;
++ if(shader) {
++ if(t.state!=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE){c.log("INTERNAL_ERROR shader source state=%s",stateName(t.state));++c.result.selfTestsFailed;return false;}
++ ID3D12DescriptorHeap* heaps[]={descriptors.Get()};c.list->SetDescriptorHeaps(1,heaps);c.list->SetComputeRootSignature(c.root.Get());c.list->SetPipelineState(t.format==DXGI_FORMAT_R32_UINT?c.uintPSO.Get():c.bytesPSO.Get());
++ UINT constants[]={t.w,t.h,t.bpp,Prefix};c.list->SetComputeRoot32BitConstants(0,4,constants,0);
++ auto gpu=descriptors->GetGPUDescriptorHandleForHeapStart();c.list->SetComputeRootDescriptorTable(1,gpu);gpu.ptr+=c.descriptorSize;c.list->SetComputeRootDescriptorTable(2,gpu);
++ c.list->Dispatch((t.w+7)/8,(t.h+7)/8,1);c.transition(output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
++ c.list->CopyBufferRegion(a.Get(),0,output.Get(),0,size);c.list->CopyBufferRegion(b.Get(),0,output.Get(),0,size);c.transition(output.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++ } else {
++ if(toggle){c.transition(t.resource.Get(),t.state,D3D12_RESOURCE_STATE_COPY_SOURCE);t.state=D3D12_RESOURCE_STATE_COPY_SOURCE;}
++ D3D12_TEXTURE_COPY_LOCATION source={};source.pResource=t.resource.Get();source.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++ for(auto*dest:{a.Get(),b.Get()}){D3D12_TEXTURE_COPY_LOCATION d={};d.pResource=dest;d.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;d.PlacedFootprint=fp;if(exactFirst&&dest==a.Get())d.PlacedFootprint.Offset=0;c.list->CopyTextureRegion(&d,0,0,0,&source,nullptr);}
++ if(toggle){c.transition(t.resource.Get(),t.state,D3D12_RESOURCE_STATE_COPY_DEST);t.state=D3D12_RESOURCE_STATE_COPY_DEST;}
++ }
++ if(!c.submit(phase))return false;
++ std::vector<unsigned char> av,bv,again;if(!c.read(a.Get(),exactFirst?t.total:size,av)||!c.read(b.Get(),size,bv)||!c.read(a.Get(),exactFirst?t.total:size,again))return false;
++ auto ao=unpack(av,exactFirst),bo=unpack(bv);UINT changed=0,first=UINT_MAX,last=0;
++ for(UINT i=0;i<ao.words.size();++i)if(ao.words[i]!=word(i,t.format)){if(first==UINT_MAX)first=i;last=i;++changed;}
++ UINT changedSecond=0,firstSecond=UINT_MAX,lastSecond=0;for(UINT i=0;i<bo.words.size();++i)if(bo.words[i]!=word(i,t.format)){if(firstSecond==UINT_MAX)firstSecond=i;lastSecond=i;++changedSecond;}
++ bool equal=ao.words==bo.words,remap=av==again;
++ c.log("OBSERVE target=%s phase=%s method=%s sourceBefore=%s sourceAfter=%s fence=%llu changed=%u first=%u last=%u hash=%016llx secondHash=%016llx outputsEqual=%u remapEqual=%u prefixTailChanges=%u,%u",target,phase,shader?"shader":toggle?"toggle":"copy",stateName(before),stateName(t.state),c.serial,changed,first,last,hash(ao.words),hash(bo.words),equal,remap,ao.guardChanges,bo.guardChanges);
++ c.log("OBSERVE_ENDPOINTS target=%s phase=%s firstExpected=%08x firstA=%08x firstB=%08x lastIndex=%u lastExpected=%08x lastA=%08x lastB=%08x",target,phase,word(0,t.format),ao.words.front(),bo.words.front(),(UINT)ao.words.size()-1,word((UINT)ao.words.size()-1,t.format),ao.words.back(),bo.words.back());
++ c.log("OBSERVE_SECOND target=%s phase=%s changed=%u first=%u last=%u prefixChanges=%u,%u tailChanges=%u,%u",target,phase,changedSecond,firstSecond,lastSecond,ao.prefixChanges,bo.prefixChanges,ao.tailChanges,bo.tailChanges);
++ UINT printed=0;for(UINT i=0;i<ao.words.size()&&printed<16;++i)if(ao.words[i]!=word(i,t.format)||bo.words[i]!=word(i,t.format)){c.log("DIFFERENCE target=%s phase=%s index=%u expected=%08x first=%08x second=%08x",target,phase,i,word(i,t.format),ao.words[i],bo.words[i]);++printed;}
++ if(changed||!equal||!remap||ao.guardChanges||bo.guardChanges){if(!bad)c.log("FIRST_BAD_INTERVAL target=%s interval=%s-to-observation-complete CPUcallAloneNotProven=1",target,phase);bad=true;}
++ return true;
++ }
++};
++struct Case {
++ UINT ownerWidth=256;bool smallPlacement=false;U64 gap=0;bool committed=false,ownerFirst=false;
++ int observer=0;DXGI_FORMAT format=DXGI_FORMAT_R8G8B8A8_UNORM;
++ D3D12_RESOURCE_STATES initial=D3D12_RESOURCE_STATE_COMMON;const char*coverage="primary";
++};
++bool formatSupported(Context&c,DXGI_FORMAT f,bool shader) {
++ D3D12_FEATURE_DATA_FORMAT_SUPPORT fs={};fs.Format=f;HRESULT hr=c.device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,&fs,sizeof(fs));
++ bool ok=SUCCEEDED(hr)&&(fs.Support1&D3D12_FORMAT_SUPPORT1_TEXTURE2D)&&(!shader||(fs.Support1&D3D12_FORMAT_SUPPORT1_SHADER_LOAD));
++ c.log("FORMAT name=%s hr=0x%08lx support1=0x%x support2=0x%x shaderLoadRequired=%u available=%u",formatName(f),(unsigned long)hr,fs.Support1,fs.Support2,shader,ok);return ok;
++}
++bool createTexture(Context&c,Image&t,ID3D12Heap*heap,U64 offset,bool committed,const char*target) {
++ HRESULT hr;if(committed){auto hp=props(D3D12_HEAP_TYPE_DEFAULT);hr=c.device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&t.desc,t.state,nullptr,IID_PPV_ARGS(&t.resource));}
++ else hr=c.device->CreatePlacedResource(heap,offset,&t.desc,t.state,nullptr,IID_PPV_ARGS(&t.resource));
++ c.log("ACTION target=%s api=%s before=absent after=%s offset=%llu hr=0x%08lx previousFence=%llu",target,committed?"CreateCommittedResource":"CreatePlacedResource",stateName(t.state),offset,(unsigned long)hr,c.serial);
++ if(FAILED(hr)){if(FAILED(c.device->GetDeviceRemovedReason()))c.checked(c.device->GetDeviceRemovedReason(),"CreateTexture/device removed");else c.log("UNAVAILABLE texture creation target=%s",target);return false;}c.keep(t.resource);return true;
++}
++void forget(Context&c,ID3D12Resource*r) {
++ ComPtr<IUnknown> identity;r->QueryInterface(IID_PPV_ARGS(&identity));
++ c.retained.erase(std::remove_if(c.retained.begin(),c.retained.end(),[&](const ComPtr<IUnknown>&p){return p.Get()==identity.Get();}),c.retained.end());
++}
++bool inject(Context&c,Image&t,bool last,const char*target) {
++ auto zero=c.makeBuffer(512,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);std::vector<unsigned char>z(512,0);if(!zero||!c.fill(zero.Get(),z)||!c.begin())return false;
++ auto before=t.state;c.transition(t.resource.Get(),before,D3D12_RESOURCE_STATE_COPY_DEST);
++ D3D12_TEXTURE_COPY_LOCATION s={},d={};s.pResource=zero.Get();s.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;s.PlacedFootprint.Footprint.Format=t.format;s.PlacedFootprint.Footprint.Width=1;s.PlacedFootprint.Footprint.Height=1;s.PlacedFootprint.Footprint.Depth=1;s.PlacedFootprint.Footprint.RowPitch=256;
++ d.pResource=t.resource.Get();d.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;c.list->CopyTextureRegion(&d,last?t.w-1:0,last?t.h-1:0,0,&s,nullptr);c.transition(t.resource.Get(),D3D12_RESOURCE_STATE_COPY_DEST,before);
++ c.log("INJECTION target=%s api=CopyTextureRegion realGPUWrite=1 expectedAffectedTexels=1 expected=%08x replacement=00000000",target,word(last?t.w*t.h-1:0,t.format));return c.submit("injection");
++}
++void runCase(Context&c,const Case&test,UINT repetition,UINT index,bool&sentinelInjected,bool&ownerInjected) {
++ bool bad=false,unavailable=false;const UINT initialSelfTests=c.result.selfTestsFailed;Image owner,sentinel;ComPtr<ID3D12Heap> heap;
++ const char*method=test.observer==0?"shader":test.observer==1?"copy":"toggle";
++ const char*layout=test.committed?"committed":test.gap?"gap4096":"adjacent";
++ c.log("CASE index=%u coverage=%s observer=%s layout=%s width=%u format=%s state=%s order=%s repetition=%u gap=%llu ownerSmall=%u",index,test.coverage,method,layout,test.ownerWidth,formatName(test.format),stateName(test.initial),test.ownerFirst?"owner-first":"sentinel-first",repetition,test.gap,test.smallPlacement);
++ auto finish=[&](){bad=bad||c.result.selfTestsFailed!=initialSelfTests;++c.result.casesCompleted;if(bad)++c.result.mismatchCases;if(unavailable)++c.result.unavailableCases;c.log("CASE_END index=%u mismatch=%u unavailable=%u",index,bad,unavailable);};
++ if(!formatSupported(c,test.format,test.observer==0)|| (test.observer==0&&!c.compute)){unavailable=true;finish();return;}
++ if(!prepare(c,owner,test.ownerWidth,test.ownerWidth,test.format,test.smallPlacement,test.initial)||!prepare(c,sentinel,32,32,test.format,true,D3D12_RESOURCE_STATE_COPY_DEST)){unavailable=true;finish();return;}
++ U64 sentinelOffset=align(owner.allocation.SizeInBytes,sentinel.allocation.Alignment)+test.gap;
++ if(test.committed)sentinelOffset=0;
++ U64 heapSize=align(sentinelOffset+sentinel.allocation.SizeInBytes,65536);
++ D3D12_HEAP_DESC hd={};hd.SizeInBytes=heapSize;hd.Properties=props(D3D12_HEAP_TYPE_DEFAULT);hd.Alignment=65536;hd.Flags=D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
++ HRESULT hh=c.device->CreateHeap(&hd,IID_PPV_ARGS(&heap));if(FAILED(hh)){c.log("UNAVAILABLE CreateHeap hr=0x%08lx",(unsigned long)hh);unavailable=true;finish();return;}c.keep(heap);
++ c.log("HEAP type=DEFAULT CPUPageProperty=UNKNOWN MemoryPool=UNKNOWN flags=%u size=%llu alignment=%llu ownerRange=[0,%llu) sentinelRange=[%llu,%llu) actualGap=%llu",(UINT)hd.Flags,heapSize,hd.Alignment,test.committed?0:owner.allocation.SizeInBytes,sentinelOffset,sentinelOffset+sentinel.allocation.SizeInBytes,test.committed?0:sentinelOffset-owner.allocation.SizeInBytes);
++ describe(c,"owner",owner,0);describe(c,"sentinel",sentinel,sentinelOffset);
++ UINT previousControlFailures=c.result.selfTestsFailed;
++ if(!rawControl(c,sentinel,"sentinel")||!rawControl(c,owner,"owner")){finish();return;}
++ bad=c.result.selfTestsFailed!=previousControlFailures;
++ if(test.ownerFirst&&!createTexture(c,owner,heap.Get(),0,test.committed,"owner")){unavailable=true;finish();return;}
++ if(!createTexture(c,sentinel,heap.Get(),sentinelOffset,false,"sentinel")){unavailable=true;finish();return;}
++ if(!c.begin()){finish();return;}c.activate(sentinel.resource.Get());copyToTexture(c,sentinel);
++ auto stable=test.observer==0?D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE:test.observer==1?D3D12_RESOURCE_STATE_COPY_SOURCE:D3D12_RESOURCE_STATE_COPY_DEST;
++ c.transition(sentinel.resource.Get(),sentinel.state,stable);sentinel.state=stable;if(!c.submit("sentinel-initialize")){finish();return;}
++ Reader observer(c,sentinel,test.observer==0,test.observer==2);if(!observer.initialize()){unavailable=!c.fatal;finish();return;}
++ const char*baseline=test.ownerFirst?"baseline-owner-already-exists":"baseline-no-owner";
++ bool baselineBad=false;
++ if(!observer.observe("sentinel",baseline,baselineBad)||!observer.observe("sentinel","baseline-repeat",baselineBad)){finish();return;}
++ c.log("SELF_TEST name=%s result=%s knownPatterns=asymmetric,all-zero,all-255",test.observer==0?"shader-pack-and-baseline":"copy-baseline",baselineBad?"FAIL":"pass");if(baselineBad)++c.result.selfTestsFailed;bad=bad||baselineBad;
++ if(!sentinelInjected&&c.options.injection==Injection::SentinelFirstWordZero&&test.observer==0&&!test.committed&&!test.gap&&test.ownerWidth==256&&!test.ownerFirst){sentinelInjected=true;if(!inject(c,sentinel,false,"sentinel-first-word")||!observer.observe("sentinel","injected-first-word",bad)){finish();return;}
++ // Independent texture-copy witness for the CI injection, restored to shader state afterward.
++ Reader witness(c,sentinel,false,false);if(witness.initialize()&&c.begin()){c.transition(sentinel.resource.Get(),sentinel.state,D3D12_RESOURCE_STATE_COPY_SOURCE);sentinel.state=D3D12_RESOURCE_STATE_COPY_SOURCE;c.submit("injection-copy-witness-transition");witness.observe("sentinel","injected-first-word-copy-witness",bad);if(c.begin()){c.transition(sentinel.resource.Get(),sentinel.state,stable);sentinel.state=stable;c.submit("injection-restore-observer-state");}}
++ }
++ if(!test.ownerFirst&&!createTexture(c,owner,heap.Get(),0,test.committed,"owner")){unavailable=true;finish();return;}
++ if(!observer.observe("sentinel","owner-CPU-create-before-activation",bad)){finish();return;}
++ auto stage=[&](const char*phase,D3D12_RESOURCE_STATES next,bool alias,bool upload){
++ c.log("ACTION target=owner api=%s phase=%s before=%s after=%s upload=%u previousFence=%llu",alias?(test.committed?"NoOp(committed-owner-alias-not-required)":"ResourceBarrier(ALIASING)"):upload?"CopyTextureRegion(upload)":"ResourceBarrier(TRANSITION)",phase,stateName(owner.state),stateName(next),upload,c.serial);
++ if(!c.begin())return false;if(alias&&!test.committed)c.activate(owner.resource.Get());c.transition(owner.resource.Get(),owner.state,next);owner.state=next;if(upload)copyToTexture(c,owner);return c.submit(phase)&&observer.observe("sentinel",phase,bad);
++ };
++ if(!stage("owner-alias-activation",owner.state,true,false)||!stage("owner-transition-COPY_DEST-no-upload",D3D12_RESOURCE_STATE_COPY_DEST,false,false)||!stage("owner-upload",D3D12_RESOURCE_STATE_COPY_DEST,false,true)){finish();return;}
++ if(!ownerInjected&&c.options.injection==Injection::OwnerLastWordZero&&test.committed&&test.observer==0){ownerInjected=true;if(!inject(c,owner,true,"owner-last-word")){finish();return;}}
++ if(!stage("owner-transition-COPY_SOURCE-no-copy",D3D12_RESOURCE_STATE_COPY_SOURCE,false,false)){finish();return;}
++ Reader ownerCopy(c,owner,false,false,true);if(!ownerCopy.initialize()||!ownerCopy.observe("owner","owner-readback-exact-and-padded",bad)||!observer.observe("sentinel","owner-readback",bad)){finish();return;}
++ if(!stage("owner-transition-PIXEL_SHADER_RESOURCE",D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,false,false)||!stage("owner-transition-NON_PIXEL_SHADER_RESOURCE",D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,false,false)){finish();return;}
++ if(c.compute&&formatSupported(c,owner.format,true)){Reader ownerShader(c,owner,true);if(!ownerShader.initialize()||!ownerShader.observe("owner","owner-shader-load",bad)||!observer.observe("sentinel","owner-shader-load",bad)){finish();return;}}
++ else {c.log("UNAVAILABLE owner shader witness");unavailable=true;}
++ // Owner readers/descriptors hold no COM reference to the texture; all work is fenced.
++ c.log("ACTION target=owner api=Release phase=owner-release completedFence=%llu",c.serial);forget(c,owner.resource.Get());owner.resource.Reset();
++ if(!observer.observe("sentinel","owner-release-after-fence",bad)){finish();return;}
++ owner.state=test.initial;if(!createTexture(c,owner,heap.Get(),0,test.committed,"owner-recreated")){unavailable=true;finish();return;}
++ if(!observer.observe("sentinel","owner-recreate-before-activation",bad)||!stage("owner-recreate-alias-activation",owner.state,true,false)){finish();return;}
++ finish();
++}
++void directCPUCase(Context&c,U64 gap,UINT repetition,UINT index) {
++ c.log("CASE index=%u coverage=optional-directCPU observer=CPU layout=%s width=256 format=RGBA8 state=COMMON order=sentinel-first repetition=%u gap=%llu",index,gap?"gap64K":"adjacent",repetition,gap);
++ bool bad=false,unavailable=false;
++ auto finish=[&](){++c.result.casesCompleted;if(bad)++c.result.mismatchCases;if(unavailable)++c.result.unavailableCases;c.log("CASE_END index=%u mismatch=%u unavailable=%u",index,bad,unavailable);};
++ if(!c.coherent||!c.tier2){c.log("UNAVAILABLE directCPU requires CacheCoherentUMA and ResourceHeapTier2 coherent=%u tier2=%u",c.coherent,c.tier2);unavailable=true;finish();return;}
++ auto hp=c.device->GetCustomHeapProperties(0,D3D12_HEAP_TYPE_UPLOAD);
++ c.log("CUSTOM_HEAP query=GetCustomHeapProperties(UPLOAD) type=%u CPUPageProperty=%u MemoryPoolPreference=%u creationNode=%u visibleNode=%u",(UINT)hp.Type,(UINT)hp.CPUPageProperty,(UINT)hp.MemoryPoolPreference,hp.CreationNodeMask,hp.VisibleNodeMask);
++ if(hp.Type!=D3D12_HEAP_TYPE_CUSTOM||hp.CPUPageProperty!=D3D12_CPU_PAGE_PROPERTY_WRITE_BACK||hp.MemoryPoolPreference!=D3D12_MEMORY_POOL_L0){unavailable=true;c.log("UNAVAILABLE directCPU no WRITE_BACK L0 custom mapping");finish();return;}
++ auto od=texture(256,256,DXGI_FORMAT_R8G8B8A8_UNORM,false),sd=buffer(65536);
++ auto oa=c.device->GetResourceAllocationInfo(0,1,&od),sa=c.device->GetResourceAllocationInfo(0,1,&sd);
++ if(oa.SizeInBytes==UINT64_MAX||sa.SizeInBytes==UINT64_MAX||oa.SizeInBytes%65536){unavailable=true;c.log("UNAVAILABLE directCPU owner end not 64KB aligned size=%llu",oa.SizeInBytes);finish();return;}
++ U64 offset=oa.SizeInBytes+gap;D3D12_HEAP_DESC hd={};hd.Properties=hp;hd.SizeInBytes=align(offset+sa.SizeInBytes,65536);hd.Alignment=65536;
++ ComPtr<ID3D12Heap>heap;ComPtr<ID3D12Resource>sentinel,owner;
++ HRESULT hr=c.device->CreateHeap(&hd,IID_PPV_ARGS(&heap));
++ if(SUCCEEDED(hr))hr=c.device->CreatePlacedResource(heap.Get(),offset,&sd,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&sentinel));
++ if(FAILED(hr)){c.log("UNAVAILABLE directCPU custom heap/buffer hr=0x%08lx",(unsigned long)hr);unavailable=true;c.inspectDebug();finish();return;}
++ c.keep(heap);c.keep(sentinel);if(!c.begin()){finish();return;}c.activate(sentinel.Get());if(!c.submit("directCPU-sentinel-activate-once")){finish();return;}
++ void*pointer=nullptr;D3D12_RANGE range={0,65536};hr=sentinel->Map(0,&range,&pointer);
++ if(FAILED(hr)||!pointer){c.log("UNAVAILABLE directCPU Map hr=0x%08lx",(unsigned long)hr);unavailable=true;c.inspectDebug();finish();return;}
++ volatile UINT*data=static_cast<volatile UINT*>(pointer);for(UINT i=0;i<16384;++i)data[i]=word(i,DXGI_FORMAT_R32_UINT);MemoryBarrier();
++ c.log("DIRECT_CPU_SETUP ownerRange=[0,%llu) sentinelRange=[%llu,%llu) gap=%llu persistentMap=1 noDefaultTextureMap=1",oa.SizeInBytes,offset,offset+65536,gap);
++ auto sample=[&](const char*phase){MemoryBarrier();std::vector<UINT>v(16384);UINT changed=0,first=UINT_MAX,last=0;for(UINT i=0;i<16384;++i){v[i]=data[i];if(v[i]!=word(i,DXGI_FORMAT_R32_UINT)){if(first==UINT_MAX)first=i;last=i;++changed;}}
++ c.log("DIRECT_CPU phase=%s changed=%u first=%u last=%u firstWord=%08x lastWord=%08x hash=%016llx previousFence=%llu GPUworkInImmediateCreateInterval=0 remap=0 sentinelTransition=0",phase,changed,first,last,v.front(),v.back(),hash(v),c.serial);
++ UINT n=0;for(UINT i=0;i<v.size()&&n<16;++i)if(v[i]!=word(i,DXGI_FORMAT_R32_UINT)){c.log("DIRECT_CPU_DIFFERENCE phase=%s index=%u expected=%08x actual=%08x",phase,i,word(i,DXGI_FORMAT_R32_UINT),v[i]);++n;}if(changed)bad=true;};
++ sample("baseline");sample("immediately-before-owner-CPU-create");
++ hr=c.device->CreatePlacedResource(heap.Get(),0,&od,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&owner));
++ // The following sample is deliberately before logging, fencing, or any GPU call.
++ sample("immediately-after-owner-CPU-create");
++ c.log("ACTION target=owner api=CreatePlacedResource(custom) hr=0x%08lx state=COMMON",(unsigned long)hr);
++ if(FAILED(hr)){unavailable=true;c.log("UNAVAILABLE directCPU custom texture");}
++ else {
++ c.keep(owner);auto state=D3D12_RESOURCE_STATE_COMMON;
++ if(c.begin()){c.activate(owner.Get());if(c.submit("directCPU-owner-only-activation"))sample("after-owner-only-activation-fence");}
++ for(auto next:{D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE}) {
++ if(c.fatal)break;sample("before-owner-only-transition");if(c.begin()){c.transition(owner.Get(),state,next);state=next;if(c.submit(stateName(next)))sample(stateName(next));}
++ }
++ if(!c.fatal){forget(c,owner.Get());owner.Reset();sample("after-owner-release");}
++ }
++ if(!c.fatal){D3D12_RANGE written={0,65536};sentinel->Unmap(0,&written);}c.inspectDebug();finish();
++}
++} // namespace
++Result Run(const Options&options,LogSink sink,void*user) {
++ // Keep pending resources and the fence event alive through process exit on a
++ // timeout/device failure. Destructing an in-flight fixture is unsafe.
++ auto context=new Context(options,sink,user);Context&c=*context;
++ if(c.initialize()) {
++ std::vector<Case> cases;
++ const D3D12_RESOURCE_STATES states[]={D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
++ UINT repeats=options.quick?1:std::max(1u,options.repeats);
++ for(int observer=0;observer<(options.quick?1:3);++observer)for(UINT s=0;s<(options.quick?1:4);++s)for(UINT layout=0;layout<5;++layout) {
++ Case x;x.observer=observer;x.initial=states[s];x.ownerWidth=(layout==0||layout==2)?64:256;x.smallPlacement=x.ownerWidth==64;x.gap=layout==2||layout==3?4096:0;x.committed=layout==4;cases.push_back(x);
++ }
++ if(!options.quick) {
++ for(int observer=0;observer<3;++observer)for(UINT width:{64u,256u})for(U64 gap:{0ull,4096ull}){Case x;x.observer=observer;x.ownerWidth=width;x.smallPlacement=width==64;x.gap=gap;x.ownerFirst=true;x.coverage="owner-first-subset";cases.push_back(x);}
++ for(UINT width:{31u,32u,33u,63u,64u,65u,255u,256u,257u,512u})for(U64 gap:{0ull,4096ull}){Case x;x.ownerWidth=width;x.smallPlacement=width<=64;x.gap=gap;x.coverage="boundary";cases.push_back(x);}
++ for(auto format:{DXGI_FORMAT_R8_UNORM,DXGI_FORMAT_R32_UINT})for(UINT width:{64u,256u})for(U64 gap:{0ull,4096ull}){Case x;x.format=format;x.ownerWidth=width;x.smallPlacement=width==64;x.gap=gap;x.coverage="formats";cases.push_back(x);}
++ }
++ c.log("MATRIX finiteCasesPerRepeat=%u repeats=%u primaryLayouts=5 primaryObservers=%u primaryInitialStates=%u boundaryWidths=31,32,33,63,64,65,255,256,257,512 optionalDirectCPUPerRepeat=%u projectedCases=%u",(UINT)cases.size(),repeats,options.quick?1:3,options.quick?1:4,options.quick?0:2,(UINT)cases.size()*repeats+(options.quick?0:2*repeats));
++ bool sentinelInjected=false,ownerInjected=false;UINT index=0;
++ for(UINT r=0;r<repeats&&!c.fatal;++r){for(const auto&x:cases){if(c.fatal)break;runCase(c,x,r+1,++index,sentinelInjected,ownerInjected);if(!c.fatal)c.retained.clear();}
++ if(!options.quick)for(U64 gap:{0ull,65536ull}){if(c.fatal)break;directCPUCase(c,gap,r+1,++index);if(!c.fatal)c.retained.clear();}}
++ if(options.injection!=Injection::None&&!(sentinelInjected||ownerInjected)){++c.result.selfTestsFailed;c.log("SELF_TEST_FAIL requested injection was not exercised");}
++ c.inspectDebug();
++ }
++ c.log("SUMMARY cases=%u mismatches=%u unavailable=%u selfTestsFailed=%u deviceFailed=%u debugErrors=%u pendingResourcesRetained=%u",c.result.casesCompleted,c.result.mismatchCases,c.result.unavailableCases,c.result.selfTestsFailed,c.result.deviceFailed,c.result.debugErrors,c.fatal);
++ Result result=c.result;if(!c.fatal)delete context;return result;
++}
++} // namespace rrdiag
+diff --git a/src/hardware/r_d3d12/isolation/isolation.h b/src/hardware/r_d3d12/isolation/isolation.h
+new file mode 100644
+index 0000000..ffe1fd6
+--- /dev/null
++++ b/src/hardware/r_d3d12/isolation/isolation.h
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Independent D3D12 placement diagnostics; no engine or host dependencies.
++#pragma once
++namespace rrdiag {
++enum class Injection { None, SentinelFirstWordZero, OwnerLastWordZero };
++struct Options {
++ bool warp=false, debug=false, gpuValidation=false, dredEnabled=false, quick=false;
++ unsigned repeats=2;
++ Injection injection=Injection::None;
++};
++struct Result {
++ unsigned casesCompleted=0, mismatchCases=0, unavailableCases=0, selfTestsFailed=0;
++ bool deviceFailed=false, debugErrors=false;
++};
++using LogSink=void(*)(void*,const char*);
++Result Run(const Options&,LogSink,void*);
++}
+diff --git a/src/hardware/r_d3d12/isolation/observe.hlsl b/src/hardware/r_d3d12/isolation/observe.hlsl
+new file mode 100644
+index 0000000..fe6b469
+--- /dev/null
++++ b/src/hardware/r_d3d12/isolation/observe.hlsl
+@@ -0,0 +1,18 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++cbuffer Dimensions : register(b0) { uint Width; uint Height; uint BytesPerPixel; uint OutputOffset; }
++Texture2D<float4> Bytes : register(t0);
++Texture2D<uint> UInts : register(t0);
++RWByteAddressBuffer Output : register(u0);
++[numthreads(8,8,1)]
++void ObserveBytes(uint3 id : SV_DispatchThreadID) {
++ if (id.x >= Width || id.y >= Height) return;
++ uint4 c = (uint4)round(saturate(Bytes.Load(int3(id.xy,0))) * 255.0);
++ uint packed = BytesPerPixel == 1 ? c.x : c.x | (c.y<<8) | (c.z<<16) | (c.w<<24);
++ // Each R8 texel occupies its own DWORD in the observation buffer.
++ Output.Store(OutputOffset + (id.y*Width+id.x)*4, packed);
++}
++[numthreads(8,8,1)]
++void ObserveUInt(uint3 id : SV_DispatchThreadID) {
++ if (id.x >= Width || id.y >= Height) return;
++ Output.Store(OutputOffset + (id.y*Width+id.x)*4, UInts.Load(int3(id.xy,0)));
++}
 diff --git a/src/hardware/r_d3d12/mips.h b/src/hardware/r_d3d12/mips.h
 new file mode 100644
 index 0000000..67884d1

@@ -1,0 +1,113 @@
+// Standalone host for the SDK-only placement isolation suite. GPL-2.0-or-later.
+#include "isolation.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace {
+struct LogState
+{
+	unsigned sentinelChanges = 0;
+	unsigned ownerChanges = 0;
+	unsigned injections = 0;
+	bool unexpectedCorruption = false;
+	bool controlsDisagree = false;
+	bool sentinelShaderWitness = false;
+	bool sentinelCopyWitness = false;
+	bool ownerShaderWitness = false;
+	bool ownerCopyWitness = false;
+	bool sentinelZero = false;
+	bool ownerZero = false;
+};
+
+void Log(void* context, const char* line)
+{
+	std::puts(line);
+	std::fflush(stdout);
+	auto& state = *static_cast<LogState*>(context);
+	if (std::strstr(line, "INJECTION target="))
+		++state.injections;
+	if (std::strstr(line, "OBSERVE target="))
+	{
+		state.controlsDisagree |= !std::strstr(line, "outputsEqual=1 ") ||
+			!std::strstr(line, "remapEqual=1 ") || !std::strstr(line, "prefixTailChanges=0,0");
+		const char* changed = std::strstr(line, "changed=");
+		if (changed && std::strtoul(changed + 8, nullptr, 10) != 0)
+		{
+			const bool sentinel = std::strstr(line, "target=sentinel ") != nullptr;
+			const bool owner = std::strstr(line, "target=owner ") != nullptr;
+			if (sentinel) ++state.sentinelChanges;
+			if (owner) ++state.ownerChanges;
+			state.sentinelShaderWitness |= sentinel && std::strstr(line, "phase=injected-first-word method=shader ");
+			state.sentinelCopyWitness |= sentinel && std::strstr(line, "phase=injected-first-word-copy-witness method=copy ");
+			state.ownerShaderWitness |= owner && std::strstr(line, "phase=owner-shader-load method=shader ");
+			state.ownerCopyWitness |= owner && std::strstr(line, "phase=owner-readback-exact-and-padded method=copy ");
+			const char* first = std::strstr(line, "first=");
+			const char* last = std::strstr(line, "last=");
+			const unsigned long expectedIndex = sentinel ? 0 : 256 * 256 - 1;
+			state.unexpectedCorruption |= !first || !last || (!sentinel && !owner) ||
+				std::strtoul(changed + 8, nullptr, 10) != 1 ||
+				(first && std::strtoul(first + 6, nullptr, 10) != expectedIndex) ||
+				(last && std::strtoul(last + 5, nullptr, 10) != expectedIndex);
+		}
+	}
+	if (std::strstr(line, "DIFFERENCE target=") && std::strstr(line, "first=00000000 second=00000000"))
+	{
+		state.sentinelZero |= std::strstr(line, "target=sentinel ") && std::strstr(line, " index=0 ");
+		state.ownerZero |= std::strstr(line, "target=owner ") && std::strstr(line, " index=65535 ");
+	}
+}
+}
+
+int main(int argc, char** argv)
+{
+	rrdiag::Options options;
+	for (int i = 1; i < argc; ++i)
+	{
+		if (!std::strcmp(argv[i], "--warp")) options.warp = true;
+		else if (!std::strcmp(argv[i], "--quick")) options.quick = true;
+		else if (!std::strcmp(argv[i], "--debug")) options.debug = true;
+		else if (!std::strcmp(argv[i], "--gpu-validation")) options.gpuValidation = true;
+		else if (!std::strcmp(argv[i], "--dred-on")) options.dredEnabled = true;
+		else if (!std::strcmp(argv[i], "--dred-off")) options.dredEnabled = false;
+		else if (!std::strcmp(argv[i], "--negative-sentinel")) options.injection = rrdiag::Injection::SentinelFirstWordZero;
+		else if (!std::strcmp(argv[i], "--negative-owner")) options.injection = rrdiag::Injection::OwnerLastWordZero;
+		else if (!std::strcmp(argv[i], "--repeats") && i + 1 < argc)
+		{
+			char* end = nullptr;
+			unsigned long value = std::strtoul(argv[++i], &end, 10);
+			if (!value || value > 16 || *end) return 64;
+			options.repeats = static_cast<unsigned>(value);
+		}
+		else
+		{
+			std::fprintf(stderr, "Unknown or incomplete argument: %s\n", argv[i]);
+			return 64;
+		}
+	}
+
+	LogState log;
+	const rrdiag::Result result = rrdiag::Run(options, Log, &log);
+	std::printf("HOST_RESULT cases=%u mismatches=%u unavailable=%u selfTestsFailed=%u deviceFailed=%u debugErrors=%u\n",
+		result.casesCompleted, result.mismatchCases, result.unavailableCases,
+		result.selfTestsFailed, result.deviceFailed ? 1 : 0, result.debugErrors ? 1 : 0);
+	const bool apiClean = !result.deviceFailed && !result.debugErrors && !result.selfTestsFailed;
+	if (options.injection != rrdiag::Injection::None)
+	{
+		const bool sentinel = options.injection == rrdiag::Injection::SentinelFirstWordZero;
+		const unsigned wanted = sentinel ? log.sentinelChanges : log.ownerChanges;
+		const unsigned unwanted = sentinel ? log.ownerChanges : log.sentinelChanges;
+		const bool witnesses = sentinel ? log.sentinelShaderWitness && log.sentinelCopyWitness && log.sentinelZero :
+			log.ownerShaderWitness && log.ownerCopyWitness && log.ownerZero;
+		if (apiClean && result.casesCompleted == 5 && result.mismatchCases == 1 && !result.unavailableCases &&
+			log.injections == 1 && wanted && !unwanted && !log.unexpectedCorruption && !log.controlsDisagree && witnesses)
+		{
+			std::printf("NEGATIVE_ORACLE_REJECTED:%s\n", sentinel ? "isolation-sentinel" : "isolation-owner");
+			return 2;
+		}
+		std::puts("NEGATIVE_ORACLE_INVALID");
+		return 3;
+	}
+	return apiClean && result.casesCompleted && !result.mismatchCases ? 0 : 1;
+}
