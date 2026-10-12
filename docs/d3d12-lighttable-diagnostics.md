@@ -4,12 +4,99 @@ These notes record the pure-white-as-black failure with VibeRant D3D12 and
 Palette Rendering, and its shared-heap placement workaround. The 64 KB placement experiment did not help and was reverted.
 Encore and table updates are not prerequisites for the reported failure.
 
-## Current state
+## Texture-canary diagnostic branch
+
+**This branch is diagnostic and is not for master.** It defaults both
+`RR_D3D12_TEXTURE_CANARIES` and `RR_D3D12_LIGHTTABLE_DIAGNOSTICS` to `1`.
+Define either as `0` to disable it. The earlier guard-only production defaults
+and historical audit below describe the preceding build.
+
+Every shared-heap texture requests its reported `SizeInBytes`, rounded up to
+4 KB, plus a 4 KB sentinel. The quarter-octave arena and its alignment-separated
+free lists are unchanged. A 32×32 RGBA8 canary texture sits immediately after
+that reported end. The device must grant exactly 4 KB size and alignment;
+otherwise a single fallback warning disables new canaries for the rest of the
+run, retaining plain guards. Committed textures have no canaries. A one-time
+`canary gap:` warning identifies a non-4-KB allocation size: the alignment gap
+could hide a smaller overrun.
+
+The canary is initialized before its owner's first upload. Its raw 32-bit texel
+words are `0xC4000000 ^ (uint32(canaryId) * 2654435761) ^ texelIndex`, with
+row-major indices 0–1023. Other canaries' moved data can therefore be identified.
+It has no shader descriptor. Three readback pages each hold 64 slots of 8192
+bytes (32 rows at 256-byte pitch). Checks copy at most 64 canaries each frame,
+prioritizing completed owner uploads and a repeat approximately 60 frames later,
+then manual requests and a round-robin sweep. Buffers are mapped only after the
+covering submission completes; unavailable pages defer checking without a CPU
+wait or an extra submission. The existing automatic light-table diagnostics
+still submit and wait synchronously and can affect reproduction timing.
+
+Readback slots retain unique canary IDs, never texture pointers. Owner retirement
+cancels its queued/manual comparisons, and a submitted result is discarded if
+its ID is no longer live. The busy slot is retained until its fence completes;
+canary resources and the whole owner block retire at the owner's pending fence.
+This avoids reading a replacement as the old owner. A manual request covers the
+live set at invocation; subsequent creations belong to later requests. Removed
+owners count as cancellations. A repeated command replaces the outstanding
+request, and pre-request copies do not satisfy the new request.
+
+### Xbox procedure
+
+1. Install the artifact from this diagnostic branch. Enable VibeRant D3D12 and
+   Palette Rendering. Start a fresh session and play **Metropolis**, including
+   the mid-race period that reproduced white rendering as black.
+2. Play for several minutes. Automatic canary sweeps, light-table checks and
+   event history require no console command. Optionally run
+   `d3d12_canarycheck`, then keep playing until `reason=manual-complete` appears.
+3. If white turns black, keep Palette Rendering enabled and optionally run
+   `d3d12_paletteprobe` before toggling it or restarting the race.
+4. Send the complete `E:\ringracers\latest-log.txt` from startup through failure
+   and recovery, with track, Encore status and approximate failure time.
+
+### Canary logs and interpretation
+
+`UWP D3D12: canary summary: live=… created=… checked=… corrupt=… fallback=…`
+prints about every ten seconds and on manual completion. `created`, `checked`,
+`corrupt` and `fallback` are cumulative: `checked` counts comparisons, `corrupt`
+counts distinct ever-corrupt canaries, and `fallback` counts owners receiving a
+plain guard instead of a canary. `live` counts current canaries. A successful
+manual completion means every surviving requested ID was compared; owners
+retired during the request were cancelled. Allocation/Map errors make checks
+unavailable and do not count as successful comparisons.
+
+`UWP D3D12: canary mismatch:` prints the canary ID, owner diagnostic ID,
+width/height, DXGI format number, mip count, small/normal placement, alignment,
+`SizeInBytes`, complete owner `GetCopyableFootprints` bytes, heap index,
+block offset/size, canary offset and alignment gap, creation frame/fence,
+latest owner upload fence, current frame, changed texel count and `allZero`.
+The first sixteen changed texels show `(x,y) expected->observed` as **raw
+32-bit words**, not the palette probe's RRGGBBAA notation. Identical corrupt
+contents log once; changed corrupt contents log an update. A mismatch also
+dumps the bounded texture event history. `canary lighttable mismatch:` is a
+rate-limited warning that a light table still differs while canaries are enabled.
+
+A changed canary confirms an unintended write outside an owner's reported
+allocation or another cross-resource write; compare the event history to exclude
+the deliberate WARP test hook. All-zero changed words suggest a clear/zeroing
+write; recognizable owner data or another canary's pattern suggests a copy or
+moved-data write. Placement offsets establish the sentinel's distance from the
+owner's allocation end, while changed texel coordinates describe the damaged
+sentinel. D3D12's opaque tiled texture layout means texel indices are not a
+portable physical byte-distance measurement.
+
+A corrupt light table with unchanged canaries contradicts the adjacent 4 KB
+overrun theory (or indicates damage beyond the sentinel, a gap, or missing
+coverage); check fallback and readback errors before drawing that conclusion.
+A clean session alone does not prove a fix, since this diagnostic build changes
+resources, timing and GPU work. Windows WARP checks validate the machinery,
+including a deliberate canary overwrite, but cannot establish Xbox behavior.
+
+## Guard workaround (before this diagnostic branch)
 
 - **Fix (confirmed on Xbox One X):** every texture placed in a shared D3D12 heap
-  has a 4 KB guard after it. On the Xbox, a placed texture can write a few bytes
-  past the size the driver reports. On an Xbox One X, the guard stopped that write
-  from corrupting the neighboring light table.
+  has a 4 KB guard after it. On Xbox One X, adding the guard stopped the
+  neighboring light-table corruption, but changed the placement layout. This
+  alone does not prove a write past the reported allocation size.
 - **Texture arena classes:** the texture arena uses quarter-octave classes
   P, 1.25P, 1.5P, 1.75P and 2P. Each request, including its 4 KB guard, rounds up
   to the next class, then to the placement alignment (4 KB or 64 KB). The largest

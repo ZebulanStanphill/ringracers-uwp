@@ -1124,6 +1124,95 @@ int main(int argc,char **argv) {
             size_t start=logs.size(); D3D12_CheckLightTablesForTest(1.0);
             require(logs.size()==start,"cleared light tables must leave no stale diagnostics");
         }
+        // Placed-texture padding canaries: production GPU writes/copies and fence-delayed readback.
+        // Keep these after perf accounting; the negative corrupts exactly the middle live owner.
+        {
+            auto require=[&](bool ok,const char *message) {
+                if(!ok) throw std::runtime_error(message);
+            };
+            auto counts=[]() {
+                std::array<UINT64,5> result={};
+                D3D12_GetCanaryCountsForTest(&result[0],&result[1],&result[2],&result[3],&result[4]);
+                return result;
+            };
+            auto drain=[&](bool request=true) {
+                const size_t start=logs.size();
+                if(request) D3D12_CheckCanariesForTest();
+                for(int frame=0;frame<4;frame++) {
+                    reset();
+                    draw({48,80,112}); D3D12_FinishUpdate(0);
+                    require(Core_WaitIdle(30000,"canary test"),"canary readback fence failed");
+                    validate(validationQueue);
+                }
+                if(request) {
+                    const std::string tail=logs.substr(start);
+                    const std::string marker=" reason=manual-complete";
+                    const size_t complete=tail.find(marker);
+                    require(complete!=std::string::npos && tail.find(marker,complete+marker.size())==std::string::npos,
+                        "one drained canary request must log one completion summary");
+                    require(tail.find("UWP D3D12: canary summary:")!=std::string::npos,
+                        "manual canary completion summary is missing");
+                }
+            };
+            drain();
+            const auto before=counts();
+            require(before[3]==0,"earlier WARP scenes corrupted a texture canary");
+            std::array<std::vector<UINT8>,3> data;
+            const std::array<UINT,3> widths={2,256,256}, heights={2,256,33};
+            std::array<GLMipmap_t,3> fixtures={};
+            for(size_t i=0;i<fixtures.size();i++) {
+                data[i].resize(widths[i]*heights[i]*4);
+                for(size_t pixel=0;pixel<data[i].size()/4;pixel++) {
+                    data[i][pixel*4]=(UINT8)(32+i*48);
+                    data[i][pixel*4+1]=80; data[i][pixel*4+2]=112; data[i][pixel*4+3]=255;
+                }
+                auto &t=fixtures[i]; t.format=GL_TEXFMT_RGBA; t.width=(UINT16)widths[i]; t.height=(UINT16)heights[i]; t.data=data[i].data();
+                reset(); texture(&t); textured();
+                require(t.downloaded!=0,"canary fixture texture creation failed");
+            }
+            drain();
+            const auto healthy=counts();
+            require(healthy[0]>=before[0]+fixtures.size() && healthy[1]>=before[1]+fixtures.size(),
+                "several live placed textures must receive canaries");
+            require(healthy[2]>=before[2]+fixtures.size() && healthy[3]==0 && healthy[4]==before[4],
+                "healthy placed canaries must be checked without corruption or fallback");
+            const size_t start=logs.size();
+            if(negative=="texture-canary")
+                require(D3D12_CorruptCanaryForTest(fixtures[1].downloaded)!=0,"middle canary corruption hook failed");
+            drain();
+            const std::string tail=logs.substr(start);
+            const std::string prefix="UWP D3D12: canary mismatch:";
+            const size_t mismatch=tail.find(prefix);
+            const auto after=counts();
+            if(negative=="texture-canary") {
+                require(mismatch!=std::string::npos && tail.find(prefix,mismatch+prefix.size())==std::string::npos,
+                    "one corrupted canary must log exactly one mismatch");
+                const size_t end=tail.find('\n',mismatch);
+                const std::string line=tail.substr(mismatch,end==std::string::npos?end:end-mismatch);
+                require(line.find("owner="+std::to_string(fixtures[1].downloaded)+" ")!=std::string::npos && after[3]==1,
+                    "canary mismatch must identify only the corrupted middle owner");
+            }
+            const bool canaryOracleMatched=mismatch==std::string::npos && after[3]==0;
+            // All uploads are fence-complete. Queue copies, then cancel their owners while
+            // those copies still belong to the unsubmitted command list.
+            require(Core_WaitIdle(30000,"canary cancellation setup"),"canary setup fence failed");
+            const size_t cancelStart=logs.size();
+            D3D12_CheckCanariesForTest();
+            for(auto &t:fixtures) deleteTexture(&t);
+            drain(false);
+            require(counts()[0]==before[0],"retired texture canaries must leave no stale live owners");
+            const std::string cancelled=logs.substr(cancelStart);
+            require(cancelled.find(prefix)==std::string::npos,
+                "cancelled canary copies must not compare retired owners");
+            const std::string completeMarker=" reason=manual-complete";
+            const size_t complete=cancelled.find(completeMarker);
+            require(complete!=std::string::npos && cancelled.find(completeMarker,complete+completeMarker.size())==std::string::npos,
+                "cancelled canary request must complete exactly once");
+            if(!canaryOracleMatched) {
+                negativeRejected=negative=="texture-canary";
+                throw std::runtime_error("healthy texture canary oracle failed");
+            }
+        }
         Prewarm_Stop(); if(!Core_WaitIdle(30000,"validation")) throw std::runtime_error("idle failed"); validate(queue.Get());
         D3D12_Shutdown(); validate(queue.Get());
         const bool closed = Core_Device() == nullptr;

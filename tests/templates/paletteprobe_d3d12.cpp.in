@@ -22,6 +22,9 @@ template<class T> struct ComPtr {std::shared_ptr<T> p; T*Get()const{return p.get
 #define IID_PPV_ARGS(x) (x)
 struct GpuTexture {ComPtr<ID3D12Resource> res; int format=4,state=3;};
 struct Texture:GpuTexture {RGBA_t paletteProbeExpected{};bool paletteProbeWhite=true;UINT paletteProbeX=2,paletteProbeY=1,width=4,height=2,mips=1,id=1;};
+// This test covers the default release behaviour: automatic checks and canaries off.
+#define RR_D3D12_LIGHTTABLE_DIAGNOSTICS 0
+#define RR_D3D12_TEXTURE_CANARIES 0
 @@DIAGNOSTICS_FLAG@@
 struct LightTable:GpuTexture {
  struct {bool valid=false;UINT chunk=0;size_t offset=0,size=0;}heapBlock;

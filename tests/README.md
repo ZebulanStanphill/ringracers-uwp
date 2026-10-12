@@ -444,3 +444,16 @@ stale entries. `--negative-control lighttable-diagnostics` omits the corruption
 and must fail the mismatch oracle. Native mocks also verify that the full CPU
 copy survives mutation of the upload input. These tests do not reproduce the
 Xbox failure or establish a cause. See [diagnostic instructions and audit](../docs/d3d12-lighttable-diagnostics.md).
+
+The WARP harness explicitly enables `RR_D3D12_TEXTURE_CANARIES`. After the existing
+scenes it creates three live placed RGBA textures (2×2, 256×256 and 256×33) and drains several frames and
+fences through the production asynchronous checker. Creation, live-owner and
+checked counts must increase; corruption and fallback counts must stay unchanged.
+Each drained manual request must log one completion summary. Queuing checks and
+then deleting their owners before submission must restore the live-owner count
+without stale comparisons. The `texture-canary`
+negative control overwrites only the middle texture's padding canary through a
+test hook. Repeated checks must report exactly one mismatch naming that owner
+and one corrupted owner, then reject the healthy oracle. This validates GPU
+canary writes, readback and retirement on Windows WARP; it does not establish
+that padding detects every possible texture corruption or measure Xbox cost.
