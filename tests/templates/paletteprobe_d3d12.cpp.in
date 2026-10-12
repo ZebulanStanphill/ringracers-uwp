@@ -8,6 +8,7 @@
 #include <string>
 #include <functional>
 #include <cstdio>
+#include <cmath>
 using UINT=unsigned; using UINT8=uint8_t; using UINT32=uint32_t; using UINT64=uint64_t; using SIZE_T=size_t;
 union RGBA_t { UINT32 rgba; struct {UINT8 red,green,blue,alpha;} s; };
 constexpr UINT D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT=512,D3D12_TEXTURE_DATA_PITCH_ALIGNMENT=256,HWR_PALETTE_LUT_SIZE=64;
@@ -21,8 +22,11 @@ template<class T> struct ComPtr {std::shared_ptr<T> p; T*Get()const{return p.get
 #define IID_PPV_ARGS(x) (x)
 struct GpuTexture {ComPtr<ID3D12Resource> res; int format=4,state=3;};
 struct Texture:GpuTexture {RGBA_t paletteProbeExpected{};bool paletteProbeWhite=true;UINT paletteProbeX=2,paletteProbeY=1,width=4,height=2,mips=1,id=1;};
-constexpr bool kLightTableDiagnostics=true;
-struct LightTable:GpuTexture {std::vector<RGBA_t> probeCpu;bool probeExpectedChanged=false;RGBA_t probeWhite[2]{};UINT8 probeWhiteColumn=0;bool probeWhiteValid=false;};
+@@DIAGNOSTICS_FLAG@@
+struct LightTable:GpuTexture {
+ struct {bool valid=false;UINT chunk=0;size_t offset=0,size=0;}heapBlock;
+ UINT srv=0;UINT64 creationFence=0;
+ bool probeChecked=false,probeMatched=false;std::vector<RGBA_t>probePrevious;const char*probeError=nullptr;std::vector<RGBA_t> probeCpu;bool probeExpectedChanged=false;RGBA_t probeWhite[2]{};UINT8 probeWhiteColumn=0;bool probeWhiteValid=false;};
 static GpuTexture g_paletteLookup,g_screenPalette; static std::map<UINT,LightTable> g_lightTables; static LightTable*g_currentLightTable; static Texture*g_units[1];
 static bool g_paletteProbePending,g_paletteRendering=true,g_postImage,g_waterRefraction,g_fogRemap,g_paletteProbeLutValid=true; static UINT g_paletteProbeDraws,g_paletteProbeLutWhite;static const char*g_paletteProbeSkip; static RGBA_t g_palette[32]{},g_screenPaletteColors[256]{},*pMasterPalette;
 constexpr UINT PF_ColorMapped=1; static UINT g_currentPolyFlags;
@@ -42,6 +46,14 @@ static bool Core_Wait(UINT64 f,UINT timeout,const char*s){++waits;assert(f==reti
 static std::vector<std::string> logs;template<class...T>void Log(const char*s,T...args){char out[2048];std::snprintf(out,sizeof out,s,args...);logs.push_back(out);}
 @@PROBE@@
 @@REMEMBER@@
+// Full-table command dispatch uses a readback stub; actual copies need Windows WARP.
+static bool g_deviceLost=false,g_shutdown=false;
+static UINT64 g_hueFrame=0;static int levelloading=0,g_reloadingMap=0,gamestate=0,gamemap=0;static UINT leveltime=0;
+static double g_lightTableNextCheck=0;static unsigned tableReads=0,eventDumps=0;
+static const char*ReadLightTable(LightTable&t,std::vector<RGBA_t>&gpu){++tableReads;gpu.resize(256*33);assert(t.res->bytes.size()==gpu.size()*sizeof(RGBA_t));std::memcpy(gpu.data(),t.res->bytes.data(),t.res->bytes.size());return nullptr;}
+static void DumpTextureEvents(UINT32){++eventDumps;}
+void CheckLightTable(UINT32,LightTable&,const char*,bool,const char* = nullptr);
+@@CHECKS@@
 static Texture texture;
 static void Reset(){queued.clear();retired.clear();texture.res.p=std::make_shared<ID3D12Resource>();g_paletteLookup.res.p=std::make_shared<ID3D12Resource>();g_screenPalette.res.p=std::make_shared<ID3D12Resource>();g_lightTables.clear();g_currentLightTable=&g_lightTables[9];g_currentLightTable->res.p=std::make_shared<ID3D12Resource>();g_paletteLookup.res->value=1;g_screenPalette.res->value=2;g_currentLightTable->res->value=3;texture.res->value=5;g_paletteLookup.format=1;g_paletteLookup.state=3;g_screenPalette.state=4;g_currentLightTable->state=5;texture.state=6;texture.paletteProbeWhite=true;texture.paletteProbeX=2;texture.paletteProbeY=1;g_units[0]=&texture;g_paletteProbePending=true;g_paletteProbeDraws=0;g_paletteProbeLutWhite=0;g_paletteRendering=g_paletteProbeLutValid=g_gl.texture2D=true;g_postImage=g_waterRefraction=g_fogRemap=false;g_program=SHADER_FLOOR;g_currentPolyFlags=PF_ColorMapped;failure=allocations=maps=unmaps=flushes=submits=waits=0;completed=false;cacheValid=true;copies.clear();events.clear();transitions.clear();logs.clear();}
 int main(){
@@ -78,6 +90,18 @@ int main(){
  assert(g_currentLightTable->probeCpu.back().rgba==retained);
  RememberPaletteProbeLightTable(*g_currentLightTable,colors.data());
  assert(g_currentLightTable->probeExpectedChanged&&g_currentLightTable->probeCpu.back().rgba==colors.back().rgba);
+ // Automatic checks are off; the manual all-table path still compares every texel.
+ assert(!kLightTableDiagnostics);
+ std::memcpy(g_currentLightTable->res->bytes.data(),colors.data(),colors.size()*sizeof(RGBA_t));
+ tableReads=eventDumps=0;logs.clear();PeriodicLightTableCheck(1000.0);
+ assert(!tableReads&&logs.empty());
+ CheckAllLightTables("manual",false);assert(tableReads==1&&logs.size()==1&&g_currentLightTable->probeMatched);
+ assert(logs.back().find("reason=manual")!=std::string::npos&&logs.back().find("mismatches=0")!=std::string::npos);
+ g_currentLightTable->res->bytes[0]^=1;
+ CheckAllLightTables("manual",false);assert(tableReads==2&&!g_currentLightTable->probeMatched&&!eventDumps);
+ assert(logs.back().find("mismatches=1")!=std::string::npos);
+ g_deviceLost=true;CheckAllLightTables("manual",false);g_deviceLost=false;
+ g_shutdown=true;CheckAllLightTables("manual",false);g_shutdown=false;assert(tableReads==2);
  // Actual bytes, including mixed 253/254/255, survive selection and exact logging.
  Reset();UINT8 pixels[32]{};
  for(UINT8 channel:{253,254,255}){std::memset(pixels,0,32);pixels[12]=channel;pixels[13]=254;pixels[14]=255;pixels[15]=255;RememberPaletteProbeWhite(texture,pixels);assert(texture.paletteProbeWhite&&texture.paletteProbeX==3&&texture.paletteProbeY==0);assert(!std::memcmp(&texture.paletteProbeExpected,pixels+12,4));}

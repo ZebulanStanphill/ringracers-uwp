@@ -201,7 +201,14 @@ To run one group, use e.g. `ctest --test-dir build/regression -R '^online_' -V`.
   SIZE_MAX limits. `PipelineKey` equality and hashing are checked for each field and
   across a deterministic 65,536-key sample. `SizeClassArena` checks fenced reuse
   through `Free` and `Collect`, chunk growth with `AddChunk`, dedicated allocations
-  above `MaxClass`, and exhaustion once no chunk can be added. The CPU mip generator
+  above `MaxClass`, and exhaustion once no chunk can be added. The texture arena's
+  quarter-octave classes are checked for rounding: each request maps to P, 1.25P,
+  1.5P, 1.75P or 2P, then to the placement alignment (4 KB or 64 KB), with a 4 MB
+  maximum for arena blocks. Seeded allocations with mixed alignments must not
+  overlap live or fence-pending blocks; each chunk serves one alignment without bump padding.
+  Fenced reuse returns a block only to an exact class and alignment match. The
+  default arena keeps its power-of-two classes and class-aligned offsets. The CPU
+  mip generator
   is checked against a scalar oracle for odd sizes and 1×N textures. The 3D texture
 repack used for the palette lookup table is checked for row pitch, slice order and
 untouched padding.
@@ -421,8 +428,13 @@ python tests/prepare-source.py build/shader-regression-source
 
 - **Invisible geometry state:** execute production `SetBlendMode`, `D3D_SetBlend` and `GetBlendState`, including the translucent sprite-silhouette to untextured sky-wall transition. All 100 pairs of blend modes must preserve the target color and depth writes, then restore RGB writes and the proper visible blend. The old implementation fails. This tests the actual D3D descriptor construction. The state fix did not resolve the reported brown walls. Pixel history subsequently identified inverted wall light slices, and the user confirmed that separate fix in build 94.
 
-The light-table diagnostic build additionally validates every texel on creation, on
-`d3d12_paletteprobe`, and on the periodic timer. The WARP scene creates three
+The native palette-probe harness also exercises the default-disabled diagnostic
+setting: periodic checks make no readback calls, while manual full-table checks
+retain the CPU baseline, detect a changed GPU texel, and omit event history.
+
+The WARP harness opts into `RR_D3D12_LIGHTTABLE_DIAGNOSTICS` at compile time
+(`kLightTableDiagnostics` is off in normal builds). It additionally validates every texel on creation, on `d3d12_paletteprobe`, and on the
+periodic timer. The WARP scene creates three
 distinct tables across three frames/recreate cycles, flushes cached textures, and
 requires successful on-creation matches. A test hook deliberately uploads a
 changed GPU texel without changing the retained CPU expectation; the periodic

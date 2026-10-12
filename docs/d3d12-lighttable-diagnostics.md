@@ -1,11 +1,36 @@
 # Xbox light-table corruption diagnostic
 
-This build diagnoses the pure-white-as-black failure with VibeRant D3D12 and
-Palette Rendering. It changes no renderer behavior to fix the failure. The
-64 KB placement experiment did not help and was reverted. Encore and table
-updates are not prerequisites for the reported failure.
+These notes record the pure-white-as-black failure with VibeRant D3D12 and
+Palette Rendering, and its shared-heap placement workaround. The 64 KB placement experiment did not help and was reverted.
+Encore and table updates are not prerequisites for the reported failure.
 
-## Xbox procedure
+## Current state
+
+- **Fix (confirmed on Xbox One X):** every texture placed in a shared D3D12 heap
+  has a 4 KB guard after it. On the Xbox, a placed texture can write a few bytes
+  past the size the driver reports. On an Xbox One X, the guard stopped that write
+  from corrupting the neighboring light table.
+- **Texture arena classes:** the texture arena uses quarter-octave classes
+  P, 1.25P, 1.5P, 1.75P and 2P. Each request, including its 4 KB guard, rounds up
+  to the next class, then to the placement alignment (4 KB or 64 KB). The largest
+  arena block is 4 MB; larger textures fall back to committed resources. Chunks and
+  free lists are separated by alignment, so bump allocation does not waste space
+  on padding. The earlier power-of-two classes doubled common exact-fit textures
+  (716 MB peak) and are historical only.
+- **Static upload arena:** unchanged. It still uses power-of-two classes.
+- **Diagnostics off by default:** the automatic light-table creation and timer
+  checks, and the texture-event recording, are disabled by default (switch
+  `kLightTableDiagnostics`). The manual `d3d12_paletteprobe` still checks the
+  retained light-table bytes against the GPU. The CPU baseline costs 33 KiB per
+  table even with automatic checks off; GPU readbacks happen only on command.
+  Define `RR_D3D12_LIGHTTABLE_DIAGNOSTICS` to enable automatic checks and event
+  history in a diagnostic build, as the Windows WARP harness does.
+
+The procedure, log format and audit below describe the diagnostic build that
+found the failure. They are kept as a record; the automatic checks run only in a
+build with `kLightTableDiagnostics` turned on.
+
+## Xbox procedure (historical)
 
 1. Install this branch's `ringracers-uwp` artifact. Start a fresh session with
    VibeRant D3D12 and Palette Rendering on.
@@ -18,6 +43,10 @@ updates are not prerequisites for the reported failure.
 4. After capturing the failure, toggle Palette Rendering off/on, run the command
    again, and play for at least 10 seconds to capture the recovery. Keep the
    session log from startup through recovery.
+
+These steps need the diagnostic build (`kLightTableDiagnostics` on). In the
+default build, only the manual `d3d12_paletteprobe` step produces light-table
+output.
 
 Send the complete log if possible. Otherwise send every `UWP D3D12: lighttable
 check:` line from level load through failure and recovery, the whole associated
@@ -38,7 +67,9 @@ GPU contents, CPU expectations or readback status. Clears happen at level load
 and also restart this schedule when Palette Rendering is toggled.
 
 Each table line contains its id, resource pointer, placed/committed status,
-zero-based heap index (`4294967295` for committed), offset, block size, SRV,
+zero-based heap index (`4294967295` for committed), offset, block size (a
+quarter-octave class in the current arena; a power of two in the earlier build
+that produced these logs), SRV,
 creation fence, frame, loading/reloading flags, numeric game state, map and
 leveltime. `error=none mismatches=0` means every texel matched. On a mismatch,
 first/last coordinates are in row-major order, values are RRGGBBAA, and `rows`
@@ -46,7 +77,7 @@ is a 33-bit hexadecimal mask (bit 0 is row 0; bit 32 is fullbright).
 `(-1,-1)` means no mismatching texel. An error is an unavailable comparison;
 its zero mismatch count does **not** mean a match.
 
-A table that changes from matching to corrupt dumps the last 128 texture events
+With automatic diagnostics enabled, a table that changes from matching to corrupt dumps the last 128 texture events
 with timestamp, frame, state, resource/id, placement, descriptor, pending fence
 and upload offset/size. Corrupt-at-creation tables also dump the history. Events
 cover ordinary texture/light-table/palette uploads and retirement, LUT creation
@@ -56,13 +87,17 @@ not enter the history: they write only READBACK buffers and would displace the
 texture writes being investigated. Present resources are committed/shared
 resources, outside the placement arena.
 
-The switch `kLightTableDiagnostics` is true in this build. Expected and previous
+The switch `kLightTableDiagnostics` was true in the build that produced the
+failing logs. It is false by default now. With it on, expected and previous
 GPU snapshots cost about 66 KiB per live table. A creation adds two covering
 submissions; periodic readback adds one per live table. Every wait is bounded at
 500 ms. Submissions and waits can change the timing and suppress reproduction;
 a clean session alone does not establish a fix.
 
-## Code-reading audit
+## Code-reading audit (historical)
+
+This audit predates the 4 KB guard. Where it describes the size-class arena, it
+means the power-of-two version, not the current quarter-octave classes.
 
 No definite corruption cause was found. Ranked hypotheses consistent with the
 actual GPU readback failure:

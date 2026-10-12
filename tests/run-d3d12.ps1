@@ -24,7 +24,7 @@ Get-ChildItem "$Engine\thirdparty" -Directory | ForEach-Object {
     if (Test-Path $Include) { $Includes += "/I$Include" }
 }
 $Exe = Join-Path $Output 'd3d12-driver.exe'
-& cl.exe /nologo /std:c++17 /O2 /EHsc /W3 /D_UWP /DHWRENDER /DHAVE_SDL /DHAVE_THREADS /D_CRT_SECURE_NO_WARNINGS /DNONX86 /DNORUSEASM @Includes "/Fe:$Exe" "/Fo:$Output\" @Files /link d3d12.lib dxgi.lib dxguid.lib
+& cl.exe /nologo /std:c++17 /O2 /EHsc /W3 /D_UWP /DHWRENDER /DHAVE_SDL /DHAVE_THREADS /D_CRT_SECURE_NO_WARNINGS /DRR_D3D12_LIGHTTABLE_DIAGNOSTICS /DNONX86 /DNORUSEASM @Includes "/Fe:$Exe" "/Fo:$Output\" @Files /link d3d12.lib dxgi.lib dxguid.lib
 if ($LASTEXITCODE -ne 0) { throw "Production D3D12 driver compilation failed" }
 & $Exe
 if ($LASTEXITCODE -eq 77) {

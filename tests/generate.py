@@ -126,6 +126,9 @@ def generate(engine, output):
     palette12 = Source(engine / "src/hardware/r_d3d12/d3d12_palette.inc")
     render(templates / "paletteprobe_d3d12.cpp.in", {
         "PROBE": probe.section("constexpr UINT kPaletteProbeSamples", "\nvoid MaybePaletteProbe") + probe.function("MaybePaletteProbe"),
+        "DIAGNOSTICS_FLAG": driver12.section("// Diagnostic build: bounded history", "\nconstexpr size_t kTextureEventCount"),
+        "CHECKS": probe.function("CheckLightTable") + probe.function("CheckAllLightTables")
+            + probe.function("PeriodicLightTableCheck"),
         "REMEMBER": driver12.function("RememberPaletteProbeWhite")
             + palette12.function("RememberPaletteProbeLightTable"),
     }, output / "paletteprobe_d3d12.cpp")
