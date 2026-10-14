@@ -1,4 +1,4 @@
-From 7fbfc3d37c7061d41499d2920e13e64b7f47b0fe Mon Sep 17 00:00:00 2001
+From 7ff3f220ddc904de1e58a76e7e676ad97f13fb69 Mon Sep 17 00:00:00 2001
 From: Zebulan Stanphill <zebulanstanphill@protonmail.com>
 Date: Sat, 3 Oct 2026 21:14:14 -0500
 Subject: [PATCH] UWP: Build Ring Racers as a static library for the UWP
@@ -727,6 +727,12 @@ Model: claude-opus-5-5
 Agent: Claude Code (Sonnet 5.5)
 Model: claude-sonnet-5-5
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- [UWP]: Give every isolation heap in the texture-memory map and CPU-visible texture tests one spare 64 KB page after its last resource, so the driver's DWORD write past a placed resource lands inside the heap instead of faulting.
+
+Agent: Claude Code (Opus 5.5)
+Model: claude-opus-5-5
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  CMakeLists.txt                                |   19 +-
  CMakePresets.json                             |   17 +
@@ -783,7 +789,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/hardware/r_d3d12/d3d12_screens.inc        |  580 ++
  src/hardware/r_d3d12/d3d12_upload.cpp         |  112 +
  src/hardware/r_d3d12/d3d12_upload.h           |   54 +
- src/hardware/r_d3d12/isolation/isolation.cpp  | 1395 ++++
+ src/hardware/r_d3d12/isolation/isolation.cpp  | 1399 ++++
  src/hardware/r_d3d12/isolation/isolation.h    |   55 +
  .../r_d3d12/isolation/minimal_repro.cpp       | 1072 +++
  src/hardware/r_d3d12/isolation/observe.hlsl   |   18 +
@@ -847,7 +853,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  src/w_wad.cpp                                 |  312 +
  src/w_wad.h                                   |   11 +
  src/z_zone.cpp                                |    5 +
- 119 files changed, 27412 insertions(+), 1137 deletions(-)
+ 119 files changed, 27416 insertions(+), 1137 deletions(-)
  create mode 100644 src/hardware/hw_glsl.h
  create mode 100644 src/hardware/r_d3d11/custom_shader.cpp
  create mode 100644 src/hardware/r_d3d11/custom_shader.h
@@ -21573,10 +21579,10 @@ index 0000000..4171b1c
 +#endif
 diff --git a/src/hardware/r_d3d12/isolation/isolation.cpp b/src/hardware/r_d3d12/isolation/isolation.cpp
 new file mode 100644
-index 0000000..fcc4bf3
+index 0000000..194f280
 --- /dev/null
 +++ b/src/hardware/r_d3d12/isolation/isolation.cpp
-@@ -0,0 +1,1395 @@
+@@ -0,0 +1,1399 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// Windows SDK and C++ standard library only. Device isolation requires a separate process:
 +// D3D12CreateDevice is a singleton per adapter while any device references remain alive.
@@ -22093,6 +22099,8 @@ index 0000000..fcc4bf3
 +}
 +const long long NoRel=LLONG_MIN;
 +const char* relText(long long v,char*buf) { if(v==NoRel)return "none"; snprintf(buf,32,"%lld",v); return buf; }
++// Spare heap space after the last resource. The Xbox driver writes a DWORD just past every placed resource.
++constexpr U64 GuardPage=65536;
 +// One map-suite case. The "window" is a ROW_MAJOR buffer over the whole CUSTOM heap that is only
 +// ever read by the CPU; the texture under test is placed inside it at offset O.
 +struct MapRun {
@@ -22205,7 +22213,9 @@ index 0000000..fcc4bf3
 + auto custom=c.device->GetCustomHeapProperties(0,D3D12_HEAP_TYPE_UPLOAD);
 + if(!usableCustomHeap(c,custom))return unavailable("no-write-back-L0-custom-heap");
 + H=align(O+S+131072,65536); words=(size_t)(H/4);
-+ D3D12_HEAP_DESC hd={}; hd.SizeInBytes=H; hd.Properties=custom; hd.Alignment=65536; hd.Flags=D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
++ // The window must not end at the heap's end: on Xbox, placing it writes a DWORD just past it (outside the
++ // heap's CPU mapping, which faults). One spare 64 KB page after the window absorbs that write.
++ D3D12_HEAP_DESC hd={}; hd.SizeInBytes=H+GuardPage; hd.Properties=custom; hd.Alignment=65536; hd.Flags=D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
 + c.crumbHeap("map-heap",hd);
 + HRESULT hr=c.device->CreateHeap(&hd,IID_PPV_ARGS(&heap)); if(FAILED(hr))return unavailable("CreateHeap",hr); c.keep(heap);
 + auto wd=buffer(H); c.crumb("CreatePlacedResource","what=window id=%u heapOffset=0 bytes=%llu state=0x%x",id,H,(UINT)D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -22219,7 +22229,7 @@ index 0000000..fcc4bf3
 + if(wrong){++c.result.selfTestsFailed;c.log("SELF_TEST_FAIL name=map-window-readback id=%u wrongWords=%llu",id,(U64)wrong);}
 + std::swap(prev,cur);
 + c.log("MAP_WATCHPOINT id=%u windowBase=0x%llx ownerEndAddress=0x%llx ownerEndOffset=%llu wordBytes=4 beforeOwnerCreation=1",id,(U64)(uintptr_t)w,(U64)(uintptr_t)(w+(O+S)/4),O+S);
-+ c.log("MAP_WINDOW id=%u heapSize=%llu windowWords=%llu textureRange=[%llu,%llu) pattern=windowWord(i)",id,H,(U64)words,O,O+S);
++ c.log("MAP_WINDOW id=%u heapSize=%llu windowBytes=%llu windowWords=%llu textureRange=[%llu,%llu) pattern=windowWord(i)",id,H+GuardPage,H,(U64)words,O,O+S);
 + // Create, then snapshot immediately: nothing is logged or submitted in between (the breadcrumb precedes the call).
 + c.crumb("CreatePlacedResource","what=texture id=%u heapOffset=%llu dimension=%s width=%llu height=%u depthOrArray=%u mips=%u format=%u flags=0x%x state=0x%x",id,O,dimName(m),(U64)desc.Width,(UINT)desc.Height,(UINT)desc.DepthOrArraySize,(UINT)desc.MipLevels,(UINT)desc.Format,(UINT)desc.Flags,(UINT)D3D12_RESOURCE_STATE_COMMON);
 + hr=c.device->CreatePlacedResource(heap.Get(),O,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&tex));
@@ -22388,7 +22398,7 @@ index 0000000..fcc4bf3
 + auto custom=c.device->GetCustomHeapProperties(0,D3D12_HEAP_TYPE_UPLOAD);
 + if(!usableCustomHeap(c,custom)) { unavailable("no-write-back-L0-custom-heap",S_OK); return; }
 + auto desc=texture(256,256,DXGI_FORMAT_R8G8B8A8_UNORM,false); ComPtr<ID3D12Heap> heap; ComPtr<ID3D12Resource> r; HRESULT hr;
-+ if(placed) { c.crumb("GetResourceAllocationInfo","placement=placed"); auto info=c.device->GetResourceAllocationInfo(0,1,&desc); D3D12_HEAP_DESC hd={}; hd.SizeInBytes=align(info.SizeInBytes,65536); hd.Properties=custom; hd.Alignment=65536; hd.Flags=D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
++ if(placed) { c.crumb("GetResourceAllocationInfo","placement=placed"); auto info=c.device->GetResourceAllocationInfo(0,1,&desc); D3D12_HEAP_DESC hd={}; hd.SizeInBytes=align(info.SizeInBytes,65536)+GuardPage; hd.Properties=custom; // spare page: see MapRun::run hd.Alignment=65536; hd.Flags=D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
 + c.crumbHeap("committed-cpu-placed",hd);
 + hr=c.device->CreateHeap(&hd,IID_PPV_ARGS(&heap)); if(SUCCEEDED(hr)){c.keep(heap);c.crumb("CreatePlacedResource","what=texture placement=placed heapOffset=0 width=256 height=256 format=%u state=0x0",(UINT)desc.Format);hr=c.device->CreatePlacedResource(heap.Get(),0,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&r));} }
 + else { c.crumb("CreateCommittedResource","what=texture placement=committed type=%u cpuPage=%u pool=%u width=256 height=256 format=%u state=0x0",(UINT)custom.Type,(UINT)custom.CPUPageProperty,(UINT)custom.MemoryPoolPreference,(UINT)desc.Format);
