@@ -150,11 +150,11 @@ private:
 			const unsigned copyFailures = result.copyOrderFailures[0] + result.copyOrderFailures[1] +
 				result.copyOrderFailures[2] + result.copyOrderFailures[3];
 			const bool detected = result.reproFailures || result.mapCasesWithOutsideWrites || result.committedCpuChanged ||
-				result.committedDefaultChanged || result.uploadSourceDamaged || copyFailures;
-			char summary[1024];
-			std::snprintf(summary, sizeof(summary), "SESSION_END pid=%lu experiment=%s ran=%u sehStages=%u stagesIncomplete=%u probesCompleted=%u watchdogReports=%u reproFailures=%u mapCasesRun=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u committedDefaultChanged=%u uploadSourceDamaged=%u defaultControlsCompleted=%u copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u deviceFailed=%u debugErrors=%u failed=%u closed=%u wallSeconds=%.3f cpuSeconds=%.3f",
+				result.committedDefaultChanged || result.uploadSourceDamaged || copyFailures || result.addressChangedWords;
+			char summary[1152];
+			std::snprintf(summary, sizeof(summary), "SESSION_END pid=%lu experiment=%s ran=%u sehStages=%u stagesIncomplete=%u probesCompleted=%u watchdogReports=%u reproFailures=%u mapCasesRun=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u committedDefaultChanged=%u uploadSourceDamaged=%u defaultControlsCompleted=%u addressCases=%u addressChangedWords=%u copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u deviceFailed=%u debugErrors=%u failed=%u closed=%u wallSeconds=%.3f cpuSeconds=%.3f",
 				static_cast<unsigned long>(GetCurrentProcessId()), state.mode, ran ? 1u : 0u, result.sehStages, result.stagesIncomplete, result.probesCompleted, result.watchdogReports, result.reproFailures, result.mapCasesRun, result.mapCasesWithOutsideWrites, result.unavailableCases,
-				result.committedCpuChanged, result.committedDefaultChanged, result.uploadSourceDamaged, result.defaultControlsCompleted, result.copyOrderFailures[0], result.copyOrderFailures[1],
+				result.committedCpuChanged, result.committedDefaultChanged, result.uploadSourceDamaged, result.defaultControlsCompleted, result.addressCases, result.addressChangedWords, result.copyOrderFailures[0], result.copyOrderFailures[1],
 				result.copyOrderFailures[2], result.copyOrderFailures[3], result.selfTestsFailed, result.deviceFailed ? 1u : 0u,
 				result.debugErrors ? 1u : 0u, failed ? 1u : 0u, state.closing ? 1u : 0u, elapsed, cpu);
 			Log(nullptr, summary);
@@ -164,7 +164,7 @@ private:
 					(detected ? L"The experiment detected changed memory. " : L"The experiment completed without detected memory changes. ");
 				text += L"Captured exceptions: " + std::to_wstring(result.sehStages) +
 					L". Unavailable: " + std::to_wstring(result.unavailableCases) +
-					L". Results have been appended to placement-isolation-log.txt in LocalState. Acknowledge to close this process. Launch the app again to choose the next experiment; collect the one log after all three choices.";
+					L". Results have been appended to placement-isolation-log.txt in LocalState. Acknowledge to close this process. Launch the app again to choose the next experiment; collect the one log after all the choices you want to run.";
 				auto completeText = ref new String(text.c_str());
 				dispatcher->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([this, completeText] {
 					if (state.closing) return;
@@ -207,10 +207,27 @@ private:
 			Utf8(AnalyticsInfo::VersionInfo->DeviceFamily).c_str(), Utf8(AnalyticsInfo::VersionInfo->DeviceFamilyVersion).c_str(),
 			(osVersion >> 48) & 0xffff, (osVersion >> 32) & 0xffff, (osVersion >> 16) & 0xffff, osVersion & 0xffff);
 		Log(nullptr, metadata);
-		auto dialog = ref new MessageDialog("Choose one experiment. This launch runs only your selection, then closes. Launch again for the other two choices; their results append to the same LocalState log.", "D3D12 isolation experiment");
-		dialog->Commands->Append(ref new UICommand("Crash details"));
-		dialog->Commands->Append(ref new UICommand("Copy ordering"));
-		dialog->Commands->Append(ref new UICommand("Texture memory"));
+		ShowPicker(false);
+	}
+
+	// MessageDialog takes at most three commands, so the four experiments are split over two pages.
+	void ShowPicker(bool more)
+	{
+		auto dialog = ref new MessageDialog(more ?
+			"Choose one experiment. This launch runs only your selection, then closes. Launch again for the other choices; their results append to the same LocalState log." :
+			"Choose one experiment. This launch runs only your selection, then closes. Launch again for the other choices (Texture memory and Fault address are under More experiments); their results append to the same LocalState log.",
+			"D3D12 isolation experiment");
+		if (more)
+		{
+			dialog->Commands->Append(ref new UICommand("Texture memory"));
+			dialog->Commands->Append(ref new UICommand("Fault address"));
+		}
+		else
+		{
+			dialog->Commands->Append(ref new UICommand("Crash details"));
+			dialog->Commands->Append(ref new UICommand("Copy ordering"));
+			dialog->Commands->Append(ref new UICommand("More experiments"));
+		}
 		auto dispatcher = window_->Dispatcher;
 		startingDialog_ = dialog->ShowAsync();
 		startingDialog_->Completed = ref new AsyncOperationCompletedHandler<IUICommand^>(
@@ -229,9 +246,11 @@ private:
 						Log(nullptr, "SESSION_END experiment=none ran=0 status=selection-canceled");
 						ExitProcess();
 					}
+					else if (std::wcscmp(selected->Label->Data(), L"More experiments") == 0) ShowPicker(true);
 					else if (std::wcscmp(selected->Label->Data(), L"Crash details") == 0) StartExperiment(rrdiag::Experiment::Crash, "crash");
 					else if (std::wcscmp(selected->Label->Data(), L"Copy ordering") == 0) StartExperiment(rrdiag::Experiment::Copy, "copy");
 					else if (std::wcscmp(selected->Label->Data(), L"Texture memory") == 0) StartExperiment(rrdiag::Experiment::Memory, "memory");
+					else if (std::wcscmp(selected->Label->Data(), L"Fault address") == 0) StartExperiment(rrdiag::Experiment::Address, "address");
 					else ExitProcess();
 				}));
 			});

@@ -79,6 +79,7 @@ int main(int argc, char** argv)
 			else if (!std::strcmp(value, "crash")) options.experiment = rrdiag::Experiment::Crash;
 			else if (!std::strcmp(value, "copy")) options.experiment = rrdiag::Experiment::Copy;
 			else if (!std::strcmp(value, "memory")) options.experiment = rrdiag::Experiment::Memory;
+			else if (!std::strcmp(value, "address")) options.experiment = rrdiag::Experiment::Address;
 			else { std::fprintf(stderr, "Unknown experiment: %s\n", value); return 64; }
 		}
 		else if (!std::strcmp(argv[i], "--self-test-seh")) options.selfTestSeh = true;
@@ -125,12 +126,14 @@ int main(int argc, char** argv)
 		std::printf("HOST_RESULT reproFailures=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u "
 			"copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u deviceFailed=%u mapCasesRun=%u committedDefaultChanged=%u "
 			"uploadSourceDamaged=%u injectionsAttempted=%u injectionsDetected=%u debugErrors=%u "
-			"defaultControlsCompleted=%u sehStages=%u stagesIncomplete=%u probesCompleted=%u watchdogReports=%u\n",
+			"defaultControlsCompleted=%u sehStages=%u stagesIncomplete=%u probesCompleted=%u watchdogReports=%u "
+			"addressCases=%u addressChangedWords=%u\n",
 			result.reproFailures, result.mapCasesWithOutsideWrites, result.unavailableCases, result.committedCpuChanged,
 			result.copyOrderFailures[0], result.copyOrderFailures[1], result.copyOrderFailures[2], result.copyOrderFailures[3],
 			result.selfTestsFailed, result.deviceFailed ? 1 : 0, result.mapCasesRun, result.committedDefaultChanged,
 			result.uploadSourceDamaged, result.injectionsAttempted, result.injectionsDetected, result.debugErrors ? 1 : 0,
-			result.defaultControlsCompleted, result.sehStages, result.stagesIncomplete, result.probesCompleted, result.watchdogReports);
+			result.defaultControlsCompleted, result.sehStages, result.stagesIncomplete, result.probesCompleted, result.watchdogReports,
+			result.addressCases, result.addressChangedWords);
 		const bool clean = !result.deviceFailed && !result.debugErrors && !result.selfTestsFailed;
 		if (options.injection == rrdiag::Injection::MapOutsideWord)
 		{
@@ -154,7 +157,8 @@ int main(int argc, char** argv)
 		// Hardware runs are expected to report the driver defect; WARP must be clean.
 		return clean && !result.sehStages && !result.stagesIncomplete && !result.watchdogReports &&
 			(options.experiment == rrdiag::Experiment::Crash ? result.probesCompleted == 1 :
-			 options.experiment == rrdiag::Experiment::Copy ? true : result.mapCasesRun > 0 && result.defaultControlsCompleted == 1) && !result.reproFailures && !result.mapCasesWithOutsideWrites &&
+			 options.experiment == rrdiag::Experiment::Copy ? true :
+			 options.experiment == rrdiag::Experiment::Address ? result.addressCases >= 3 : result.mapCasesRun > 0 && result.defaultControlsCompleted == 1) && !result.reproFailures && !result.mapCasesWithOutsideWrites &&
 			!result.committedCpuChanged && !result.committedDefaultChanged && !result.uploadSourceDamaged && !copyFailures ? 0 : 1;
 	}
 	std::printf("HOST_RESULT cases=%u mismatches=%u unavailable=%u selfTestsFailed=%u deviceFailed=%u debugErrors=%u\n",

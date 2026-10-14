@@ -280,6 +280,44 @@ function Assert-CrashDetails([string]$Name, [string[]]$Lines) {
 $Lines = RunDefaultProbe 'warp-default' @('--warp', '--debug', '--gpu-validation') 0
 VerifyDefaultHealthy 'warp-default' $Lines
 
+# Fault address experiment on WARP: the predicted target is the window pointer plus the heap size, the four
+# placements are logged in order with nothing logged between a create and its snapshot, and WARP writes
+# nothing at the end of E1/E2 and nothing inside the window for E3 and returns from the E4 placement.
+function Assert-AddressExperiment([string]$Name, [string[]]$Lines, $Counts) {
+    if ([int]$Counts['addressCases'] -lt 3) { throw "$Name completed fewer than three placement cases: $($Counts['addressCases'])." }
+    if (@($Lines | Where-Object { $_ -match '^(ADDR_UNAVAILABLE|ADDR_MATCH|SELF_TEST_FAIL) ' }).Count) { throw "$Name logged an unavailable step, a fault comparison or a failed self-test." }
+    $Windows = @($Lines | Where-Object { $_ -cmatch '^ADDR_WINDOW ptr=0x[0-9a-f]+ size=131072$' })
+    $Bases = @($Lines | Where-Object { $_ -cmatch '^ADDR_BASE heapCpuBase=0x[0-9a-f]+ source=window-map-pointer windowHeapOffset=0 heapEndTarget=0x[0-9a-f]+$' })
+    if ($Windows.Count -ne 1 -or $Bases.Count -ne 1) { throw "$Name has no unique ADDR_WINDOW/ADDR_BASE." }
+    $Pointer = [Convert]::ToUInt64([regex]::Match($Windows[0], 'ptr=0x([0-9a-f]+)').Groups[1].Value, 16)
+    $Base = [Convert]::ToUInt64([regex]::Match($Bases[0], 'heapCpuBase=0x([0-9a-f]+)').Groups[1].Value, 16)
+    $HeapEnd = [Convert]::ToUInt64([regex]::Match($Bases[0], 'heapEndTarget=0x([0-9a-f]+)').Groups[1].Value, 16)
+    if ($Base -ne $Pointer -or $HeapEnd -ne ($Base + [uint64]262144)) { throw "$Name heap base/end target disagree with the window pointer." }
+    $Predict = Find-LineIndex $Lines '^ADDR_PREDICT case=E4 heapOffset=196608 size=65536 predictedTarget=0x[0-9a-f]+$'
+    if ($Predict -lt 0 -or @($Lines | Where-Object { $_ -match '^ADDR_PREDICT ' }).Count -ne 1) { throw "$Name has no unique E4 prediction." }
+    $Predicted = [Convert]::ToUInt64([regex]::Match($Lines[$Predict], 'predictedTarget=0x([0-9a-f]+)').Groups[1].Value, 16)
+    if ($Predicted -ne $HeapEnd) { throw "$Name predicted $Predicted, expected the heap end $HeapEnd." }
+    if ($Lines[$Predict + 1] -cnotmatch '^CALL stage=E api=CreatePlacedResource what=E4-buffer heapOffset=196608 ' -or
+        $Lines[$Predict + 2] -cne 'ADDR_CASE case=E4 returned=1 hr=0x00000000') { throw "$Name E4 is not 'predict, breadcrumb, create returned' on WARP." }
+    foreach ($Case in 'E1', 'E2', 'E3', 'E4') {
+        if (@($Lines | Where-Object { $_ -cmatch "^ADDR_CASE case=$Case " }).Count -ne 1) { throw "$Name has no unique ADDR_CASE for $Case." }
+    }
+    if (-not ($Lines | Where-Object { $_ -cmatch '^ADDR_CASE case=E1 resourceEnd=65536 changed=[0-9]+ changedAtResourceEnd=0$' })) { throw "$Name E1 changed the DWORD at its resource end." }
+    if (-not ($Lines | Where-Object { $_ -cmatch '^ADDR_CASE case=E2 (resourceEnd=65536 changed=[0-9]+ changedAtResourceEnd=0|unavailable=1 reason=allocation-size-not-65536 size=[0-9]+)$' })) { throw "$Name E2 changed the DWORD at its resource end." }
+    if ($Lines | Where-Object { $_ -cmatch '^ADDR_CASE case=E2 unavailable=1' }) { Write-Host "$Name E2: the 128x128 texture is not 65536 bytes on WARP; case skipped as unavailable." }
+    if (-not ($Lines | Where-Object { $_ -ceq 'ADDR_CASE case=E3 changed=0 resourceEnd=131072 endInsideWindow=0' })) { throw "$Name E3 control changed memory inside the window." }
+    foreach ($Line in $Lines) {
+        if ($Line -cmatch '^ADDR_CHANGE case=E[12] heapOffset=([0-9]+) ' -and [long]$Matches[1] -ge 65536) { throw "$Name changed memory at or past a resource end: $Line" }
+    }
+    # Nothing is logged between a CreatePlacedResource and the window snapshot that follows it.
+    for ($Index = 0; $Index -lt $Lines.Count - 1; $Index++) {
+        if ($Lines[$Index] -cmatch '^CALL stage=E api=CreatePlacedResource what=E([123])-') {
+            $Case = $Matches[1]
+            if ($Lines[$Index + 1] -cnotmatch "^ADDR_(CHANGE|CASE) case=E$Case ") { throw "$Name logged between CreatePlacedResource(E$Case) and its snapshot: $($Lines[$Index + 1])" }
+        }
+    }
+}
+
 # Each selectable Xbox experiment gets an independent console process in CI.
 function RunSelectedExperiment([string]$Experiment, [string[]]$ExpectedStages, [bool]$DredOff) {
     $Name = "warp-$Experiment"
@@ -326,11 +364,13 @@ function RunSelectedExperiment([string]$Experiment, [string[]]$ExpectedStages, [
         }
         if (-not ($Lines | Where-Object { $_ -match '^COMMITTED_DEFAULT uploadSourceIntact=1 uploadSourceIntactFinal=1 .*changedTexels=0 ' })) { throw "$Name default committed/source control missing or failed." }
     }
+    if ($Experiment -ceq 'address') { Assert-AddressExperiment $Name $Lines $Counts }
     Write-Host "Verified ${Name}: independent process, selected stages $($ExpectedStages -join ','), clean WARP results."
 }
 RunSelectedExperiment 'crash' @('P1') $false
 RunSelectedExperiment 'copy' @('D') $false
 RunSelectedExperiment 'memory' @('W', 'B', 'C') $true
+RunSelectedExperiment 'address' @('E') $false
 
 # SEH self-test: a deterministic nullptr write exercises context, unwind and
 # process-stop behavior. No D3D12 production stage may follow the exception.
@@ -354,6 +394,7 @@ if (-not ($Lines | Where-Object { $_ -match '^HOST_RESULT .* sehStages=1 stagesI
 # Rich-record checks below are tied to the core's stable log fields, not an
 # optimization-dependent exact fault PC or register value.
 Assert-CrashDetails $Name $Lines
+if (-not ($Lines | Where-Object { $_ -ceq 'ADDR_MATCH predicted=0x0 actual=0x0 equal=1 delta=0' })) { throw "$Name did not compare the armed fault-address prediction with the faulting address." }
 if (-not ($Lines | Where-Object { $_ -ceq 'PIPELINE_STOP stage=self-test reason=seh noLaterStages=1 separateProcessRequired=1' })) { throw "$Name did not mark the pipeline as stopped." }
 $CrashCounts = Get-Fields (@($Lines | Where-Object { $_ -match '^MAP_SUMMARY ' })[0])
 foreach ($Key in 'mapCasesRun', 'defaultControlsCompleted') { if ($CrashCounts[$Key] -cne '0') { throw "$Name executed $Key after fault." } }
