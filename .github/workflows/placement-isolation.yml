@@ -2,7 +2,7 @@ name: D3D12 placement isolation
 
 on:
   push:
-    branches: [d3d12-placement-isolation, d3d12-placement-map]
+    branches: [d3d12-placement-isolation, d3d12-placement-map, d3d12-isolation-capture]
   workflow_dispatch:
 
 jobs:

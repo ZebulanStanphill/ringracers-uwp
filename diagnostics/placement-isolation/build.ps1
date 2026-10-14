@@ -112,9 +112,9 @@ $Console = Join-Path $Output 'placement-isolation.exe'
 Push-Location $Output
 try {
     Exec {
-        cl.exe /nologo /std:c++17 /O2 /EHsc /W4 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX `
+        cl.exe /nologo /std:c++17 /O2 /Zi /EHsc /W4 /MD /DWIN32_LEAN_AND_MEAN /DNOMINMAX `
             "/I$Core" "/I$Generated" (Join-Path $PSScriptRoot 'console.cpp') (Join-Path $Core 'isolation.cpp') (Join-Path $Core 'minimal_repro.cpp') `
-            "/Fe:$Console" /link d3d12.lib dxgi.lib dxguid.lib
+            "/Fe:$Console" /link /DEBUG:FULL "/PDB:$(Join-Path $Output 'placement-isolation.pdb')" d3d12.lib dxgi.lib dxguid.lib
     }
 } finally { Pop-Location }
 
@@ -151,7 +151,7 @@ function Get-Fields([string]$Line) {
 # Every stage ran and completed, no crash was captured, the watchdog stayed silent, and each first-use probe finished.
 function Assert-Supervision([string]$Name, [string[]]$Lines) {
     if (@($Lines | Where-Object { $_ -match '^(SEH|WATCHDOG) ' }).Count) { throw "$Name logged an SEH exception or a WATCHDOG report." }
-    $Stages = 'P1', 'P2', 'P3', 'P4', 'P5', 'A', 'B', 'C', 'D'
+    $Stages = 'P1', 'P2', 'P3', 'P4', 'P5', 'A', 'B', 'C', 'W', 'D'
     foreach ($StageId in $Stages) {
         $Begins = @($Lines | Where-Object { $_ -ceq "STAGE_BEGIN stage=$StageId" })
         $Ends = @($Lines | Where-Object { $_ -match "^STAGE_END stage=$StageId result=" })
@@ -195,7 +195,7 @@ function RunDefaultProbe([string]$Name, [string[]]$Arguments, [int]$ExpectedExit
     $HostFields = Get-Fields $Results[0]
     foreach ($Key in 'reproFailures', 'mapCasesWithOutsideWrites', 'unavailable', 'committedCpuChanged', 'copyOrderFailures', 'selfTestsFailed',
                      'deviceFailed', 'mapCasesRun', 'committedDefaultChanged', 'uploadSourceDamaged', 'injectionsAttempted', 'injectionsDetected', 'debugErrors',
-                     'sehStages', 'stagesIncomplete', 'probesCompleted', 'watchdogReports') {
+                     'defaultControlsCompleted', 'sehStages', 'stagesIncomplete', 'probesCompleted', 'watchdogReports') {
         if (-not $Counts.ContainsKey($Key) -or $Counts[$Key] -cne $HostFields[$Key]) { throw "$Name core/host summaries disagree on $Key." }
     }
     if ($Counts['reproFailures'] -cne (Get-Fields $ReproSummaries[0])['failures']) { throw "$Name repro summary disagrees with MAP_SUMMARY." }
@@ -265,17 +265,75 @@ function VerifyDefaultHealthy([string]$Name, [string[]]$Lines) {
             if ($Lines[$Index + 1] -cnotmatch '^REPRO variant=custom step=create_texture ') { throw "$Name logged between the repro's CreatePlacedResource(texture) and its observation: $($Lines[$Index + 1])" }
         }
     }
-    foreach ($StageId in 'A', 'B', 'C', 'D') {
+    foreach ($StageId in 'A', 'B', 'C', 'W', 'D') {
         if (-not ($Lines | Where-Object { $_ -match "^CALL stage=$StageId api=" })) { throw "$Name has no CALL breadcrumbs for stage $StageId." }
     }
     Write-Host "Verified ${Name}: minimal repro, $($Counts['mapCasesRun']) map cases with no writes outside the textures, committed CPU/default controls and four copy-order variants."
 }
 
+function Assert-CrashDetails([string]$Name, [string[]]$Lines) {
+    if (-not ($Lines | Where-Object { $_ -match '^SEH_ACCESS accessKind=write accessValue=0x1 accessTarget=0x0$' })) { throw "$Name did not identify the deliberate write to nullptr." }
+    if (-not ($Lines | Where-Object { $_ -match '^SEH_REGISTERS architecture=x64 Rip=0x[0-9a-f]+ Rsp=0x[0-9a-f]+' })) { throw "$Name did not capture exception registers." }
+    if (-not ($Lines | Where-Object { $_ -match '^SEH_FRAME index=0 .*module=placement-isolation\.exe .*offset=0x[0-9a-f]+ .*peValid=1 source=exception-context$' })) { throw "$Name exception frame 0 is not in the console executable." }
+}
+
 $Lines = RunDefaultProbe 'warp-default' @('--warp', '--debug', '--gpu-validation') 0
 VerifyDefaultHealthy 'warp-default' $Lines
 
-# SEH self-test: a test-only first stage writes to nullptr; the guard must log the exception and every
-# following stage must still run to completion on its own device.
+# Each selectable Xbox experiment gets an independent console process in CI.
+function RunSelectedExperiment([string]$Experiment, [string[]]$ExpectedStages, [bool]$DredOff) {
+    $Name = "warp-$Experiment"
+    $Log = Join-Path $Logs "$Name.txt"
+    $Arguments = @('--warp', '--debug', '--gpu-validation', '--experiment', $Experiment)
+    if ($DredOff) { $Arguments += '--dred-off' }
+    & $Console @Arguments *> $Log
+    if ($LASTEXITCODE -ne 0) { throw "$Name failed: exit $LASTEXITCODE; see $Log" }
+    $Lines = @(Get-Content $Log)
+    $Summaries = @($Lines | Where-Object { $_ -match '^MAP_SUMMARY ' })
+    $Hosts = @($Lines | Where-Object { $_ -match '^HOST_RESULT ' })
+    if ($Summaries.Count -ne 1 -or $Hosts.Count -ne 1) { throw "$Name missing unique core/host completion." }
+    $Counts = Get-Fields $Summaries[0]
+    $HostFields = Get-Fields $Hosts[0]
+    foreach ($Key in $HostFields.Keys) { if ($Counts[$Key] -cne $HostFields[$Key]) { throw "$Name core/host $Key disagrees." } }
+    foreach ($Key in 'reproFailures', 'mapCasesWithOutsideWrites', 'committedCpuChanged', 'committedDefaultChanged', 'uploadSourceDamaged',
+                    'selfTestsFailed', 'deviceFailed', 'debugErrors', 'sehStages', 'stagesIncomplete', 'watchdogReports') {
+        if ($Counts[$Key] -cne '0') { throw "$Name expected $Key=0, got $($Counts[$Key])." }
+    }
+    if ($Counts['copyOrderFailures'] -cne '0/0/0/0') { throw "$Name copy failures." }
+    if (@($Lines | Where-Object { $_ -match '^(SEH|WATCHDOG|API_FAILURE|REPRO_API_FAILURE|REPRO_FATAL_WAIT|FATAL_WAIT|DEVICE_REMOVED|REPRO_DEVICE_REMOVED|SELF_TEST_FAIL) ' }).Count) { throw "$Name contains an exception, validation or device failure." }
+    $Begins = @($Lines | Where-Object { $_ -match '^STAGE_BEGIN stage=' })
+    $Ends = @($Lines | Where-Object { $_ -match '^STAGE_END stage=' })
+    if ($Begins.Count -ne $ExpectedStages.Count -or $Ends.Count -ne $ExpectedStages.Count) { throw "$Name executed stages outside its selection." }
+    for ($Index = 0; $Index -lt $ExpectedStages.Count; $Index++) {
+        if ($Begins[$Index] -cne "STAGE_BEGIN stage=$($ExpectedStages[$Index])" -or $Ends[$Index] -cne "STAGE_END stage=$($ExpectedStages[$Index]) result=completed") {
+            throw "$Name wrong stage order/completion."
+        }
+    }
+    $SettingPattern = if ($DredOff) { 'dredRequested=0 dredApplied=1 configuredBeforeDevice=1 dredUntouched=0' } else { 'dredRequested=0 dredApplied=0 configuredBeforeDevice=1 dredUntouched=1' }
+    if (-not ($Lines | Where-Object { $_ -match "SETTINGS debugRequested=1 debugApplied=1 gbvRequested=1 gbvApplied=1 $SettingPattern" })) { throw "$Name wrong debug/GBV/DRED configuration." }
+    if ($Experiment -ceq 'crash' -and $Counts['probesCompleted'] -cne '1') { throw "$Name did not complete P1." }
+    if ($Experiment -ceq 'copy') {
+        foreach ($Variant in 'D1', 'D2', 'D3', 'D4') { if (-not ($Lines | Where-Object { $_ -ceq "COPY_ORDER_SUMMARY variant=$Variant failures=0/20" })) { throw "$Name did not run all 20 iterations for $Variant." } }
+    }
+    if ($Experiment -ceq 'memory') {
+        if ($Counts['defaultControlsCompleted'] -cne '1') { throw "$Name did not finish its warmup/control." }
+        if ([int]$Counts['mapCasesRun'] -lt 29 -or @($Lines | Where-Object { $_ -match '^MAP_CASE_END ' }).Count -ne [int]$Counts['mapCasesRun']) { throw "$Name did not run the full memory map." }
+        foreach ($Placement in 'committed', 'placed') {
+            if (-not ($Lines | Where-Object { $_ -match "^COMMITTED_CPU placement=$Placement step=to_COMMON changedTexels=0 " })) { throw "$Name committed CPU test ($Placement) incomplete." }
+            $Phases = @($Lines | Where-Object { $_ -match "^COMMITTED_CPU_PHASE placement=$Placement target=\S+ cpuReadState=COMMON$" })
+            $Returns = @($Lines | Where-Object { $_ -match "^COMMITTED_CPU_RETURN placement=$Placement target=\S+ state=COMMON fenced=1$" })
+            if ($Phases.Count -ne 5 -or $Returns.Count -ne 5) { throw "$Name did not fence each $Placement texture back to COMMON." }
+        }
+        if (-not ($Lines | Where-Object { $_ -match '^COMMITTED_DEFAULT uploadSourceIntact=1 uploadSourceIntactFinal=1 .*changedTexels=0 ' })) { throw "$Name default committed/source control missing or failed." }
+    }
+    Write-Host "Verified ${Name}: independent process, selected stages $($ExpectedStages -join ','), clean WARP results."
+}
+RunSelectedExperiment 'crash' @('P1') $false
+RunSelectedExperiment 'copy' @('D') $false
+RunSelectedExperiment 'memory' @('W', 'B', 'C') $true
+
+# SEH self-test: a deterministic nullptr write exercises context, unwind and
+# process-stop behavior. No D3D12 production stage may follow the exception.
 $Name = 'self-test-seh'
 $Log = Join-Path $Logs "$Name.txt"
 Write-Host "Running $Name; complete observations: $Log"
@@ -283,17 +341,24 @@ Write-Host "Running $Name; complete observations: $Log"
 if ($LASTEXITCODE -ne 0) { throw "$Name failed: exit $LASTEXITCODE; see $Log" }
 $Lines = @(Get-Content $Log)
 $SehLines = @($Lines | Where-Object { $_ -match '^SEH ' })
-if ($SehLines.Count -ne 1 -or $SehLines[0] -cnotmatch '^SEH stage=self-test code=0xc0000005 address=0x[0-9a-f]+ module=placement-isolation\.exe offset=0x[0-9a-f]+ handler=stage-guard thread=[0-9]+$') {
+if ($SehLines.Count -ne 1 -or $SehLines[0] -cnotmatch '^SEH stage=self-test code=0xc0000005 .*module=placement-isolation\.exe offset=0x[0-9a-f]+ ') {
     throw "$Name did not log exactly one access violation in the self-test stage: $($SehLines -join ' | ')"
 }
-Write-Host $SehLines[0]
 if (-not ($Lines | Where-Object { $_ -ceq 'STAGE_END stage=self-test result=seh' })) { throw "$Name self-test stage did not end with result=seh." }
 if (@($Lines | Where-Object { $_ -match '^WATCHDOG ' }).Count) { throw "$Name logged a WATCHDOG report." }
-foreach ($StageId in 'P1', 'P2', 'P3', 'P4', 'P5', 'A', 'B', 'C', 'D') {
-    if (-not ($Lines | Where-Object { $_ -ceq "STAGE_END stage=$StageId result=completed" })) { throw "$Name stage $StageId did not complete after the SEH exception." }
+if (@($Lines | Where-Object { $_ -match '^STAGE_BEGIN stage=' }).Count -ne 1 -or
+    @($Lines | Where-Object { $_ -match '^STAGE_END stage=' }).Count -ne 1) {
+    throw "$Name ran a production stage after the exception."
 }
-if (-not ($Lines | Where-Object { $_ -match '^HOST_RESULT .* sehStages=1 stagesIncomplete=1 ' })) { throw "$Name host result does not report exactly one crashed stage." }
-Write-Host "Verified ${Name}: access violation captured in stage self-test, all nine later stages completed."
+if (-not ($Lines | Where-Object { $_ -match '^HOST_RESULT .* sehStages=1 stagesIncomplete=1 probesCompleted=0 watchdogReports=0$' })) { throw "$Name host result does not report exactly one crashed stage and no production probes." }
+# Rich-record checks below are tied to the core's stable log fields, not an
+# optimization-dependent exact fault PC or register value.
+Assert-CrashDetails $Name $Lines
+if (-not ($Lines | Where-Object { $_ -ceq 'PIPELINE_STOP stage=self-test reason=seh noLaterStages=1 separateProcessRequired=1' })) { throw "$Name did not mark the pipeline as stopped." }
+$CrashCounts = Get-Fields (@($Lines | Where-Object { $_ -match '^MAP_SUMMARY ' })[0])
+foreach ($Key in 'mapCasesRun', 'defaultControlsCompleted') { if ($CrashCounts[$Key] -cne '0') { throw "$Name executed $Key after fault." } }
+if ($CrashCounts['pipelineStopped'] -cne '1') { throw "$Name missing pipelineStopped=1." }
+Write-Host "Verified ${Name}: access violation captured with context; no later stage ran."
 
 # Injection self-test: the harness itself clears one DWORD just past each texture; the map
 # suite must report exactly that DWORD, once, at the right offset, and nothing else.
@@ -353,6 +418,14 @@ if ($Manifest.Package.Identity.Name -cne 'RingRacersD3D12Isolation' -or
 }
 Copy-Item $ManifestPath (Join-Path $Stage 'AppxManifest.xml') -Force
 Copy-Item (Join-Path $Output 'uwp/RingRacersD3D12Isolation.exe') $Stage -Force
+$NativePdb = Join-Path $Output 'uwp/RingRacersD3D12Isolation.pdb'
+if (-not (Test-Path $NativePdb -PathType Leaf) -or (Get-Item $NativePdb).Length -eq 0) { throw 'Native UWP PDB was not generated.' }
+New-Item -ItemType Directory -Force (Join-Path $Install 'Symbols') | Out-Null
+Copy-Item $NativePdb (Join-Path $Install 'Symbols') -Force
+Copy-Item (Join-Path $Output 'placement-isolation.pdb') (Join-Path $Install 'Symbols') -Force
+Copy-Item $Console (Join-Path $Install 'Symbols') -Force
+Copy-Item (Join-Path $Output 'uwp/RingRacersD3D12Isolation.exe') (Join-Path $Install 'Symbols') -Force
+
 Get-ChildItem (Join-Path $Output 'uwp') -Filter '*.winmd' | Copy-Item -Destination $Stage -Force
 New-Item -ItemType Directory -Force (Join-Path $Stage 'Assets'), (Join-Path $Stage 'Licenses') | Out-Null
 # Original repository artwork; no game assets or runtime libraries are packaged.
@@ -379,7 +452,7 @@ $VCLibs = Find-VCLibsDependency $VCLibsSdkRoots
 New-Item -ItemType Directory -Force (Join-Path $Install 'Dependencies/x64') | Out-Null
 Copy-Item -LiteralPath $VCLibs -Destination (Join-Path $Install 'Dependencies/x64') -Force
 
-$Package = Join-Path $Install 'RingRacersD3D12Isolation_1.0.0.0_x64.msix'
+$Package = Join-Path $Install ('RingRacersD3D12Isolation_' + $Manifest.Package.Identity.Version + '_x64.msix')
 $PriConfig = Join-Path $Output 'priconfig.xml'
 Exec { MakePri.exe createconfig /o /cf $PriConfig /dq en-US }
 [xml]$PriXml = Get-Content $PriConfig

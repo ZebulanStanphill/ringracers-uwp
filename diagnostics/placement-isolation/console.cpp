@@ -72,6 +72,15 @@ int main(int argc, char** argv)
 		else if (!std::strcmp(argv[i], "--gpu-validation")) options.gpuValidation = true;
 		else if (!std::strcmp(argv[i], "--dred-on")) { options.dredEnabled = true; options.dredExplicit = true; }
 		else if (!std::strcmp(argv[i], "--dred-off")) { options.dredEnabled = false; options.dredExplicit = true; }
+		else if (!std::strcmp(argv[i], "--experiment") && i + 1 < argc)
+		{
+			const char* value = argv[++i];
+			if (!std::strcmp(value, "all")) options.experiment = rrdiag::Experiment::All;
+			else if (!std::strcmp(value, "crash")) options.experiment = rrdiag::Experiment::Crash;
+			else if (!std::strcmp(value, "copy")) options.experiment = rrdiag::Experiment::Copy;
+			else if (!std::strcmp(value, "memory")) options.experiment = rrdiag::Experiment::Memory;
+			else { std::fprintf(stderr, "Unknown experiment: %s\n", value); return 64; }
+		}
 		else if (!std::strcmp(argv[i], "--self-test-seh")) options.selfTestSeh = true;
 		else if (!std::strcmp(argv[i], "--legacy-suite")) options.legacySuite = true;
 		else if (!std::strcmp(argv[i], "--repro-only")) reproOnly = true;
@@ -116,12 +125,12 @@ int main(int argc, char** argv)
 		std::printf("HOST_RESULT reproFailures=%u mapCasesWithOutsideWrites=%u unavailable=%u committedCpuChanged=%u "
 			"copyOrderFailures=%u/%u/%u/%u selfTestsFailed=%u deviceFailed=%u mapCasesRun=%u committedDefaultChanged=%u "
 			"uploadSourceDamaged=%u injectionsAttempted=%u injectionsDetected=%u debugErrors=%u "
-			"sehStages=%u stagesIncomplete=%u probesCompleted=%u watchdogReports=%u\n",
+			"defaultControlsCompleted=%u sehStages=%u stagesIncomplete=%u probesCompleted=%u watchdogReports=%u\n",
 			result.reproFailures, result.mapCasesWithOutsideWrites, result.unavailableCases, result.committedCpuChanged,
 			result.copyOrderFailures[0], result.copyOrderFailures[1], result.copyOrderFailures[2], result.copyOrderFailures[3],
 			result.selfTestsFailed, result.deviceFailed ? 1 : 0, result.mapCasesRun, result.committedDefaultChanged,
 			result.uploadSourceDamaged, result.injectionsAttempted, result.injectionsDetected, result.debugErrors ? 1 : 0,
-			result.sehStages, result.stagesIncomplete, result.probesCompleted, result.watchdogReports);
+			result.defaultControlsCompleted, result.sehStages, result.stagesIncomplete, result.probesCompleted, result.watchdogReports);
 		const bool clean = !result.deviceFailed && !result.debugErrors && !result.selfTestsFailed;
 		if (options.injection == rrdiag::Injection::MapOutsideWord)
 		{
@@ -138,11 +147,14 @@ int main(int argc, char** argv)
 		}
 		if (options.selfTestSeh)
 		{
-			// The self-test stage must be the only stage that ended in an SEH exception; every other stage ran.
-			return clean && result.sehStages == 1 && result.stagesIncomplete == 1 && result.mapCasesRun && !result.watchdogReports ? 0 : 1;
+			// A caught exception poisons the process: no production stage may follow it.
+			return clean && result.sehStages == 1 && result.stagesIncomplete == 1 && !result.probesCompleted &&
+				!result.mapCasesRun && !result.reproFailures && !copyFailures && !result.watchdogReports ? 0 : 1;
 		}
 		// Hardware runs are expected to report the driver defect; WARP must be clean.
-		return clean && !result.sehStages && !result.watchdogReports && result.mapCasesRun && !result.reproFailures && !result.mapCasesWithOutsideWrites &&
+		return clean && !result.sehStages && !result.stagesIncomplete && !result.watchdogReports &&
+			(options.experiment == rrdiag::Experiment::Crash ? result.probesCompleted == 1 :
+			 options.experiment == rrdiag::Experiment::Copy ? true : result.mapCasesRun > 0 && result.defaultControlsCompleted == 1) && !result.reproFailures && !result.mapCasesWithOutsideWrites &&
 			!result.committedCpuChanged && !result.committedDefaultChanged && !result.uploadSourceDamaged && !copyFailures ? 0 : 1;
 	}
 	std::printf("HOST_RESULT cases=%u mismatches=%u unavailable=%u selfTestsFailed=%u deviceFailed=%u debugErrors=%u\n",
