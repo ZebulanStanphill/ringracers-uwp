@@ -390,7 +390,7 @@ if (@($Lines | Where-Object { $_ -match '^STAGE_BEGIN stage=' }).Count -ne 1 -or
     @($Lines | Where-Object { $_ -match '^STAGE_END stage=' }).Count -ne 1) {
     throw "$Name ran a production stage after the exception."
 }
-if (-not ($Lines | Where-Object { $_ -match '^HOST_RESULT .* sehStages=1 stagesIncomplete=1 probesCompleted=0 watchdogReports=0$' })) { throw "$Name host result does not report exactly one crashed stage and no production probes." }
+if (-not ($Lines | Where-Object { $_ -match '^HOST_RESULT .* sehStages=1 stagesIncomplete=1 probesCompleted=0 watchdogReports=0 addressCases=0 addressChangedWords=0$' })) { throw "$Name host result does not report exactly one crashed stage and no production probes." }
 # Rich-record checks below are tied to the core's stable log fields, not an
 # optimization-dependent exact fault PC or register value.
 Assert-CrashDetails $Name $Lines
