@@ -1,0 +1,4 @@
+[submodule "RingRacers"]
+	path = RingRacers
+	url = https://github.com/ZebulanStanphill/RingRacers.git
+	branch = master
